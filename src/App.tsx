@@ -7,6 +7,7 @@ import { ActiveOrderTracker } from './components/ActiveOrderTracker';
 import { AdminDashboard } from './components/AdminDashboard';
 import { AdminLoginModal } from './components/AdminLoginModal';
 import { PwaInstallPrompt } from './components/PwaInstallPrompt';
+import { FloatingWhatsAppButton } from './components/FloatingWhatsAppButton';
 import { PRE_TRANSLATED_PRODUCTS, CATEGORY_ARABIC_MAP } from './data/preTranslatedArabic';
 import {
   generateOrderNumber,
@@ -31,6 +32,15 @@ import {
   logoutAdmin,
   isEmailAuthorizedAdmin,
 } from './services/adminAuthService';
+import {
+  DEFAULT_WHATSAPP_NUMBER,
+  loadCachedWhatsAppNumber,
+  fetchPublicStoreConfig,
+  saveWhatsAppNumberInFirestore,
+  fetchCatalogPushMeta,
+  fetchCatalogSnapshotFromFirestore,
+  pushCatalogToCustomerDevices,
+} from './services/storeConfigService';
 import { testFirestoreConnection } from './firebase';
 import { playNewOrderChime } from './utils/audio';
 import { printOrderTo58mmPrinter } from './utils/thermalPrinter';
@@ -45,6 +55,7 @@ import type {
 
 const CATALOG_CACHE_KEY = 'makarem_salesplay_catalog_v2';
 const CATALOG_VERSION_KEY = 'makarem_salesplay_catalog_version';
+const PUSH_VERSION_KEY = 'makarem_admin_push_sync_version_v1';
 
 type AppRoute = 'shop' | 'profile' | 'admin';
 
@@ -59,6 +70,23 @@ function getInitialRoute(): AppRoute {
     }
   }
   return 'shop';
+}
+
+function getUrlCustomerIdentifier(): string | null {
+  if (typeof window === 'undefined') return null;
+  const params = new URLSearchParams(window.location.search);
+  const hasQrParam =
+    params.has('cid') ||
+    params.has('code') ||
+    params.has('id') ||
+    params.has('phone') ||
+    params.has('q') ||
+    (window.location.pathname.startsWith('/profile/') &&
+      window.location.pathname.replace(/\/+$/, '').length > '/profile'.length);
+
+  if (!hasQrParam) return null;
+  const id = extractCustomerIdentifier(window.location.href);
+  return id || null;
 }
 
 function loadCachedCatalog(): InventoryItem[] {
@@ -85,6 +113,10 @@ export default function App() {
   const [customerProfile, setCustomerProfile] = useState<CustomerProfile | null>(() =>
     loadLocalCustomerProfile()
   );
+  const [isUrlAutoLoggingIn, setIsUrlAutoLoggingIn] = useState<boolean>(() =>
+    Boolean(getUrlCustomerIdentifier())
+  );
+  const [urlAutoLoginError, setUrlAutoLoginError] = useState<string | null>(null);
 
   // Cart & Checkout Drawer
   const [selectedItems, setSelectedItems] = useState<OrderItem[]>([]);
@@ -97,12 +129,17 @@ export default function App() {
     return isEmailAuthorizedAdmin(savedEmail);
   });
 
-  // 58mm Thermal Auto-Print Toggle (when Bluetooth printer is paired in Admin Panel)
+  // WhatsApp support number (persisted in Firestore store_settings/public_config)
+  const [whatsappNumber, setWhatsappNumber] = useState<string>(() =>
+    loadCachedWhatsAppNumber() || DEFAULT_WHATSAPP_NUMBER
+  );
+
+  // 58mm Thermal Auto-Print Toggle (when printer is paired in Admin Panel)
   const [autoPrintEnabled, setAutoPrintEnabled] = useState<boolean>(false);
   const autoPrintRef = useRef(autoPrintEnabled);
   autoPrintRef.current = autoPrintEnabled;
 
-  // Catalog loaded EXCLUSIVELY from SalesPlay POS + smart daily-cached Firestore media/translations
+  // Catalog loaded from SalesPlay POS + Firestore snapshot fallback + push-triggered sync
   const [rawSalesPlayItems, setRawSalesPlayItems] = useState<InventoryItem[]>(loadCachedCatalog);
   const [isLoadingCatalog, setIsLoadingCatalog] = useState<boolean>(
     () => loadCachedCatalog().length === 0
@@ -127,7 +164,7 @@ export default function App() {
   // SalesPlay shop metadata
   const [salesplayShop, setSalesplayShop] = useState<SalesPlayShop | null>(null);
 
-  // URL Navigation synced with History API (/ and /profile)
+  // URL Navigation synced with History API (/, /profile, /profile/:custid)
   const navigateTo = useCallback(
     (route: AppRoute) => {
       if (route === 'admin' && !isAdminLoggedIn) {
@@ -144,42 +181,49 @@ export default function App() {
     [isAdminLoggedIn]
   );
 
+  // Resolve /profile/:custid (e.g. /profile/001, /profile/1001, /profile/002) or ?cid=001
+  const resolveUrlCustomerLogin = useCallback(async (identifier: string) => {
+    setIsUrlAutoLoggingIn(true);
+    setUrlAutoLoginError(null);
+    setCurrentRoute('profile');
+    try {
+      const profile = await loginOrRegisterCustomer(identifier);
+      setCustomerProfile(profile);
+      const cleanPath = `/profile/${encodeURIComponent(profile.customerCode)}`;
+      if (window.location.pathname !== cleanPath || window.location.search) {
+        window.history.replaceState({ route: 'profile' }, '', cleanPath);
+      }
+    } catch (err: any) {
+      console.warn('URL customer auto-login notice:', err);
+      setCustomerProfile(null);
+      setUrlAutoLoginError(
+        err?.message || `No customer account found for ID #${identifier}`
+      );
+    } finally {
+      setIsUrlAutoLoggingIn(false);
+    }
+  }, []);
+
   useEffect(() => {
+    const initialId = getUrlCustomerIdentifier();
+    if (initialId) {
+      resolveUrlCustomerLogin(initialId);
+    }
+
     const onPopState = () => {
-      setCurrentRoute(window.location.pathname.startsWith('/profile') ? 'profile' : 'shop');
+      if (window.location.pathname.startsWith('/profile')) {
+        setCurrentRoute('profile');
+        const nextId = getUrlCustomerIdentifier();
+        if (nextId) {
+          resolveUrlCustomerLogin(nextId);
+        }
+      } else {
+        setCurrentRoute('shop');
+      }
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, []);
-
-  // Auto-login & redirect cleanly when scanning Family Credit Card QR URL (/profile?cid=001)
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const params = new URLSearchParams(window.location.search);
-    const hasQrParam =
-      params.has('cid') ||
-      params.has('code') ||
-      params.has('id') ||
-      params.has('phone') ||
-      params.has('q') ||
-      (window.location.pathname.startsWith('/profile/') &&
-        window.location.pathname.length > '/profile/'.length);
-
-    if (!hasQrParam) return;
-    const identifier = extractCustomerIdentifier(window.location.href);
-    if (!identifier) return;
-
-    loginOrRegisterCustomer(identifier)
-      .then((profile) => {
-        setCustomerProfile(profile);
-        setCurrentRoute('profile');
-        window.history.replaceState({ route: 'profile' }, '', '/profile');
-      })
-      .catch((err) => {
-        console.warn('QR redirect login notice:', err);
-        setCurrentRoute('profile');
-      });
-  }, []);
+  }, [resolveUrlCustomerLogin]);
 
   // Listen to Firebase Admin Auth state
   useEffect(() => {
@@ -191,16 +235,6 @@ export default function App() {
     });
     return () => unsub();
   }, [currentRoute]);
-
-  // Smart daily Firestore sync for Arabic translations & custom product photos (max 1 meta doc check/day per customer)
-  useEffect(() => {
-    syncFirestoreCatalogEnhancements({ force: false })
-      .then(({ translations, media }) => {
-        setFirestoreTranslations(translations);
-        setProductMediaMap(media);
-      })
-      .catch(() => null);
-  }, []);
 
   // Build enriched catalog from real SalesPlay items + pre-translations + Firestore translations
   const catalog: InventoryItem[] = React.useMemo(() => {
@@ -216,9 +250,9 @@ export default function App() {
       const arabicCategory =
         normalizedCat === 'Uncategorized'
           ? 'غير مصنف'
-          : fsTr?.arabicCategory ||
+          : CATEGORY_ARABIC_MAP[normalizedCat] ||
+            fsTr?.arabicCategory ||
             item.arabicCategory ||
-            CATEGORY_ARABIC_MAP[normalizedCat] ||
             normalizedCat;
 
       const customImg =
@@ -238,61 +272,92 @@ export default function App() {
     });
   }, [rawSalesPlayItems, productMediaMap, firestoreTranslations]);
 
-  // Smart delta SalesPlay product sync: only pulls full payload if catalogVersion changed
+  // Fetch live SalesPlay POS catalog with retry + Firestore snapshot fallback (guarantees launch NEVER shows empty!)
   const fetchSalesPlayProducts = useCallback(
     async (_showSpinner = false, forcePosRefresh = false): Promise<InventoryItem[]> => {
+      const tryBackendFetch = async (attempt: number): Promise<InventoryItem[] | null> => {
+        try {
+          const localVersion = localStorage.getItem(CATALOG_VERSION_KEY) || '';
+          const hasCached = loadCachedCatalog().length > 0;
+          const params = new URLSearchParams();
+          if (forcePosRefresh) {
+            params.set('force', '1');
+          } else if (hasCached && localVersion) {
+            params.set('sinceVersion', localVersion);
+          }
+
+          const res = await fetch(`/api/salesplay/products?${params.toString()}`, {
+            cache: 'no-store',
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+
+          if (data.success && data.unchanged) {
+            return loadCachedCatalog();
+          }
+
+          if (data.success && Array.isArray(data.products) && data.products.length > 0) {
+            const loaded: InventoryItem[] = data.products.map((sp: any) => ({
+              id: sp.id,
+              productCode: sp.productCode || '',
+              name: sp.name,
+              arabicName: sp.arabicName || '',
+              category:
+                !sp.category || sp.category === 'No category'
+                  ? 'Uncategorized'
+                  : sp.category,
+              arabicCategory: sp.arabicCategory || '',
+              price: Number(sp.price || 0),
+              unit: sp.unit || 'pcs',
+              stock: sp.stock !== undefined ? Number(sp.stock) : 0,
+              stockControl: Boolean(sp.stockControl),
+              barcode: sp.barcode || '',
+              salesplayItemId: sp.id,
+              imageUrl: sp.imageUrl || '',
+            }));
+
+            setRawSalesPlayItems(loaded);
+            try {
+              localStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify(loaded));
+              if (data.catalogVersion) {
+                localStorage.setItem(CATALOG_VERSION_KEY, String(data.catalogVersion));
+              }
+            } catch {
+              // ignore storage quota errors
+            }
+            return loaded;
+          }
+          return null;
+        } catch (err) {
+          if (attempt < 1) {
+            await new Promise((r) => setTimeout(r, 1200));
+            return tryBackendFetch(attempt + 1);
+          }
+          console.warn('SalesPlay products fetch error:', err);
+          return null;
+        }
+      };
+
       try {
-        const localVersion = localStorage.getItem(CATALOG_VERSION_KEY) || '';
-        const hasCached = loadCachedCatalog().length > 0;
-        const params = new URLSearchParams();
-        if (forcePosRefresh) {
-          params.set('force', '1');
-        } else if (hasCached && localVersion) {
-          params.set('sinceVersion', localVersion);
+        const backendProducts = await tryBackendFetch(0);
+        if (backendProducts && backendProducts.length > 0) {
+          return backendProducts;
         }
 
-        const res = await fetch(`/api/salesplay/products?${params.toString()}`, {
-          cache: 'no-store',
-        });
-        const data = await res.json();
-
-        if (data.success && data.unchanged) {
-          return loadCachedCatalog();
-        }
-
-        if (data.success && Array.isArray(data.products)) {
-          const loaded: InventoryItem[] = data.products.map((sp: any) => ({
-            id: sp.id,
-            productCode: sp.productCode || '',
-            name: sp.name,
-            arabicName: sp.arabicName || '',
-            category:
-              !sp.category || sp.category === 'No category'
-                ? 'Uncategorized'
-                : sp.category,
-            arabicCategory: sp.arabicCategory || '',
-            price: Number(sp.price || 0),
-            unit: sp.unit || 'pcs',
-            stock: sp.stock !== undefined ? Number(sp.stock) : 0,
-            stockControl: Boolean(sp.stockControl),
-            barcode: sp.barcode || '',
-            salesplayItemId: sp.id,
-            imageUrl: sp.imageUrl || '',
-          }));
-          setRawSalesPlayItems(loaded);
+        // Resilience fallback: load compact catalog snapshot stored in Firestore (e.g. if API unavailable on static launch)
+        const snapshot = await fetchCatalogSnapshotFromFirestore();
+        if (snapshot && snapshot.products.length > 0) {
+          setRawSalesPlayItems(snapshot.products);
           try {
-            localStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify(loaded));
-            if (data.catalogVersion) {
-              localStorage.setItem(CATALOG_VERSION_KEY, String(data.catalogVersion));
+            localStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify(snapshot.products));
+            if (snapshot.catalogSyncVersion) {
+              localStorage.setItem(PUSH_VERSION_KEY, snapshot.catalogSyncVersion);
             }
           } catch {
-            // ignore quota errors
+            // ignore storage errors
           }
-          return loaded;
+          return snapshot.products;
         }
-        return [];
-      } catch (err) {
-        console.warn('SalesPlay products fetch error:', err);
         return [];
       } finally {
         setIsLoadingCatalog(false);
@@ -301,8 +366,8 @@ export default function App() {
     []
   );
 
-  // Admin Refresh & Update Items -> bypass server cache, force Firestore sync, & translate new items via Gemini
-  const handleAdminRefreshAndTranslate = useCallback(async () => {
+  // Admin "Sync to Customer Devices": refreshes SalesPlay POS + translates new items + pushes snapshot/version to all customer devices
+  const handleSyncToCustomerDevices = useCallback(async () => {
     const [freshItems, freshFs] = await Promise.all([
       fetchSalesPlayProducts(true, true),
       syncFirestoreCatalogEnhancements({ force: true }),
@@ -321,24 +386,48 @@ export default function App() {
       return !hasFs && !hasPre;
     });
 
-    if (untranslated.length === 0) {
-      return { totalItems: itemsToCheck.length, translatedNew: 0 };
+    let translatedNew = 0;
+    let translationError: string | undefined;
+
+    if (untranslated.length > 0) {
+      const trRes = await translateMissingProducts(untranslated);
+      translatedNew = trRes.translatedCount;
+      if (!trRes.success) {
+        translationError = trRes.error;
+      }
+      if (trRes.translatedCount > 0) {
+        setFirestoreTranslations((prev) => ({ ...prev, ...trRes.translations }));
+      }
     }
 
-    const trRes = await translateMissingProducts(untranslated);
-    if (trRes.translatedCount > 0) {
-      setFirestoreTranslations((prev) => ({ ...prev, ...trRes.translations }));
+    // Push single compact snapshot + bump push version in store_settings/catalog_meta
+    let pushedToDevices = false;
+    if (itemsToCheck.length > 0) {
+      const newPushVersion = String(Date.now());
+      try {
+        await pushCatalogToCustomerDevices(itemsToCheck, newPushVersion);
+        localStorage.setItem(PUSH_VERSION_KEY, newPushVersion);
+        pushedToDevices = true;
+      } catch (err) {
+        console.warn('Could not push catalog snapshot to customer devices:', err);
+      }
     }
+
     return {
       totalItems: itemsToCheck.length,
-      translatedNew: trRes.translatedCount,
-      translationError: trRes.success ? undefined : trRes.error,
+      translatedNew,
+      translationError,
+      pushedToDevices,
     };
   }, [fetchSalesPlayProducts, rawSalesPlayItems]);
 
-  // Bootstrap Firebase & one-shot delta catalog sync on page open/refresh (no aggressive polling)
+  // Bootstrap store settings, WhatsApp number, and Smart Push-Triggered Catalog Sync on app open/refresh
   useEffect(() => {
     testFirestoreConnection();
+
+    fetchPublicStoreConfig()
+      .then((cfg) => setWhatsappNumber(cfg.whatsappNumber || DEFAULT_WHATSAPP_NUMBER))
+      .catch(() => null);
 
     fetch('/api/salesplay/status', { cache: 'no-store' })
       .then((res) => res.json())
@@ -354,7 +443,38 @@ export default function App() {
       })
       .catch(() => null);
 
-    fetchSalesPlayProducts(false, false);
+    const bootstrapCatalogSmartly = async () => {
+      const cachedItems = loadCachedCatalog();
+      const localPushVer = localStorage.getItem(PUSH_VERSION_KEY) || '';
+      const remoteMeta = await fetchCatalogPushMeta();
+      const remotePushVer = remoteMeta?.catalogSyncVersion || '';
+
+      const isColdLaunch = cachedItems.length === 0;
+      const adminPushedUpdate = Boolean(remotePushVer && remotePushVer !== localPushVer);
+
+      if (isColdLaunch || adminPushedUpdate) {
+        // First time ever OR Admin clicked "Sync to Customer Devices": fetch full items, categories, translations & media once!
+        await Promise.all([
+          fetchSalesPlayProducts(false, adminPushedUpdate),
+          syncFirestoreCatalogEnhancements({ force: true }).then(({ translations, media }) => {
+            setFirestoreTranslations(translations);
+            setProductMediaMap(media);
+          }),
+        ]);
+        if (remotePushVer) {
+          try {
+            localStorage.setItem(PUSH_VERSION_KEY, remotePushVer);
+          } catch {
+            // ignore
+          }
+        }
+      } else {
+        // Already synced up to Admin's latest push -> zero POS API calls & zero extra Firestore reads!
+        setIsLoadingCatalog(false);
+      }
+    };
+
+    bootstrapCatalogSmartly();
   }, [fetchSalesPlayProducts]);
 
   // Real-time orders listener (Admin only) + Sound Chime + 58mm Auto-Print
@@ -475,12 +595,23 @@ export default function App() {
   const handleCustomerLogin = async (identifier: string): Promise<CustomerProfile> => {
     const loggedIn = await loginOrRegisterCustomer(identifier);
     setCustomerProfile(loggedIn);
+    setUrlAutoLoginError(null);
     return loggedIn;
   };
 
   const handleCustomerLogout = () => {
     clearLocalCustomerProfile();
     setCustomerProfile(null);
+    setUrlAutoLoginError(null);
+    if (window.location.pathname !== '/profile') {
+      window.history.replaceState({ route: 'profile' }, '', '/profile');
+    }
+  };
+
+  const handleSaveWhatsAppNumber = async (phone: string) => {
+    const saved = await saveWhatsAppNumberInFirestore(phone);
+    setWhatsappNumber(saved);
+    return saved;
   };
 
   const handleConfirmOrder = async ({
@@ -540,6 +671,8 @@ export default function App() {
   };
 
   const cartItemCount = selectedItems.reduce((acc, i) => acc + i.quantity, 0);
+  const showStickyCartBar =
+    currentRoute === 'shop' && !activeOrder && cartItemCount > 0;
 
   return (
     <div
@@ -565,12 +698,14 @@ export default function App() {
           <AdminDashboard
             orders={orders}
             catalog={catalog}
-            onRefreshAndTranslateCatalog={handleAdminRefreshAndTranslate}
+            onRefreshAndTranslateCatalog={handleSyncToCustomerDevices}
             onUpdateProductImage={(productId, imageUrl) =>
               setProductMediaMap((prev) => ({ ...prev, [productId]: imageUrl }))
             }
             autoPrintEnabled={autoPrintEnabled}
             onToggleAutoPrint={setAutoPrintEnabled}
+            whatsappNumber={whatsappNumber}
+            onSaveWhatsAppNumber={handleSaveWhatsAppNumber}
             language={language}
             salesplayShop={salesplayShop}
           />
@@ -585,6 +720,8 @@ export default function App() {
               setActiveOrder(ord);
               navigateTo('shop');
             }}
+            isAutoLoggingIn={isUrlAutoLoggingIn}
+            autoLoginError={urlAutoLoginError}
             language={language}
           />
         ) : activeOrder ? (
@@ -638,6 +775,15 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* Floating WhatsApp Corner Support Button (Customer Views) */}
+      {currentRoute !== 'admin' && (
+        <FloatingWhatsAppButton
+          whatsappNumber={whatsappNumber}
+          language={language}
+          liftForCartBar={showStickyCartBar}
+        />
+      )}
 
       <CartCheckoutDrawer
         isOpen={isCartOpen}

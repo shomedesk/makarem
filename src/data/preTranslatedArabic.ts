@@ -1,9 +1,16 @@
 // Pre-translated Arabic names for existing SalesPlay store products.
 // New products added later in SalesPlay stay in English until refreshed & translated via Admin.
 export const CATEGORY_ARABIC_MAP: Record<string, string> = {
-  "Icecream": "آيسكريم ومثلجات",
-  "Drink": "مشروبات وعصائر",
   "Snacks": "وجبات خفيفة وحلويات",
+  "HEAVY SNACKS": "سناكات كبيرة ومشبعة",
+  "Heavy Snacks": "سناكات كبيرة ومشبعة",
+  "CHIPS": "شيبس ومقرمشات",
+  "Chips": "شيبس ومقرمشات",
+  "Drink": "مشروبات وعصائر",
+  "Drinks": "مشروبات وعصائر",
+  "Milk & Dairy items": "الحليب ومنتجات الألبان",
+  "Milk & Dairy": "الحليب ومنتجات الألبان",
+  "Icecream": "آيسكريم ومثلجات",
   "Grocery": "مواد غذائية وتموين",
   "WATER": "مياه",
   "BABY CARE": "العناية بالطفل",

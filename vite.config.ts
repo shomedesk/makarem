@@ -47,9 +47,9 @@ export default defineConfig(() => {
       VitePWA({
         registerType: 'autoUpdate',
         devOptions: {
-          enabled: true,
+          enabled: false,
         },
-        includeAssets: ['favicon.png', 'apple-touch-icon.png', 'icon.svg'],
+        includeAssets: ['favicon.png', 'apple-touch-icon.png', 'icon.svg', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
           name: 'Makarem Al-Khair Modern Grocery',
@@ -83,12 +83,16 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          clientsClaim: true,
+          skipWaiting: true,
+          cleanupOutdatedCaches: true,
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          navigateFallback: '/index.html',
           navigateFallbackDenylist: [/^\/api\//],
           runtimeCaching: [
             {
-              urlPattern: /^\/api\/.*/i,
+              urlPattern: /\/api\//i,
               handler: 'NetworkOnly',
             },
             {

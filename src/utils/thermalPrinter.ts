@@ -1,8 +1,8 @@
 import type { Order } from '../types';
 
 /**
- * Known BLE GATT Service & Characteristic UUIDs for 58mm Thermal Bluetooth Printers
- * (Xprinter, Rongta, Goojprt, MHT-P58, Munbyn, POS-58, Sunmi, Generic BLE ESC/POS)
+ * Known BLE GATT Service UUIDs for 58mm Thermal Bluetooth Printers
+ * (Xprinter, Rongta, Goojprt, MHT-P58, Munbyn, POS-58, Sunmi, ZJ-58 BLE, Nordic UART, ISSC)
  */
 const THERMAL_PRINTER_SERVICES = [
   '000018f0-0000-1000-8000-00805f9b34fb',
@@ -10,8 +10,19 @@ const THERMAL_PRINTER_SERVICES = [
   '49535343-fe7d-4ae5-8fa9-9fafd205e455',
   '0000ffe0-0000-1000-8000-00805f9b34fb',
   '0000ff00-0000-1000-8000-00805f9b34fb',
+  '0000fff0-0000-1000-8000-00805f9b34fb',
   '0000fee7-0000-1000-8000-00805f9b34fb',
+  '0000ae30-0000-1000-8000-00805f9b34fb',
+  '0000ae00-0000-1000-8000-00805f9b34fb',
+  '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+  'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f',
+  '00001101-0000-1000-8000-00805f9b34fb',
+  '00001800-0000-1000-8000-00805f9b34fb',
+  '00001801-0000-1000-8000-00805f9b34fb',
+  '0000180a-0000-1000-8000-00805f9b34fb',
 ];
+
+export type PrinterTransportMode = 'bluetooth' | 'serial' | 'rawbt' | 'browser';
 
 export interface BluetoothPrinterSession {
   device: any;
@@ -19,15 +30,74 @@ export interface BluetoothPrinterSession {
   deviceName: string;
 }
 
+export interface SerialPrinterSession {
+  port: any;
+  deviceName: string;
+  baudRate: number;
+}
+
+const LS_PRINTER_MODE_KEY = 'makarem_printer_mode_v1';
+
 let activePrinterSession: BluetoothPrinterSession | null = null;
+let activeSerialSession: SerialPrinterSession | null = null;
+let rawbtModeEnabled =
+  typeof localStorage !== 'undefined' && localStorage.getItem(LS_PRINTER_MODE_KEY) === 'rawbt';
 
 export function isWebBluetoothSupported(): boolean {
   return typeof navigator !== 'undefined' && Boolean((navigator as any).bluetooth);
 }
 
+export function isWebSerialSupported(): boolean {
+  return typeof navigator !== 'undefined' && Boolean((navigator as any).serial);
+}
+
+export function isRunningInsideIframe(): boolean {
+  try {
+    return typeof window !== 'undefined' && window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+export function isRawBtModeEnabled(): boolean {
+  return rawbtModeEnabled;
+}
+
+export function setRawBtModeEnabled(enabled: boolean): void {
+  rawbtModeEnabled = enabled;
+  try {
+    if (enabled) {
+      localStorage.setItem(LS_PRINTER_MODE_KEY, 'rawbt');
+    } else if (localStorage.getItem(LS_PRINTER_MODE_KEY) === 'rawbt') {
+      localStorage.removeItem(LS_PRINTER_MODE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function getActivePrinterTransport(): PrinterTransportMode {
+  if (activePrinterSession?.device?.gatt?.connected && activePrinterSession.characteristic) {
+    return 'bluetooth';
+  }
+  if (activeSerialSession?.port?.writable) {
+    return 'serial';
+  }
+  if (rawbtModeEnabled) {
+    return 'rawbt';
+  }
+  return 'browser';
+}
+
 export function getConnectedPrinterName(): string | null {
   if (activePrinterSession?.device?.gatt?.connected) {
     return activePrinterSession.deviceName;
+  }
+  if (activeSerialSession?.port?.writable) {
+    return activeSerialSession.deviceName;
+  }
+  if (rawbtModeEnabled) {
+    return 'Android RawBT (Classic BT 58mm)';
   }
   return null;
 }
@@ -40,24 +110,49 @@ export function disconnectBluetoothPrinter(): void {
   } catch {
     // ignore disconnect errors
   }
+  try {
+    if (activeSerialSession?.port?.close) {
+      activeSerialSession.port.close().catch(() => null);
+    }
+  } catch {
+    // ignore serial close errors
+  }
   activePrinterSession = null;
+  activeSerialSession = null;
+  setRawBtModeEnabled(false);
 }
 
 /**
- * Connects via Web Bluetooth to a 58mm Thermal Printer and caches the writable GATT characteristic.
+ * Connects via Web Bluetooth BLE to a 58mm Thermal Printer and caches the writable GATT characteristic.
  */
 export async function connectBluetooth58mmPrinter(): Promise<string> {
   const nav = navigator as any;
   if (!nav?.bluetooth) {
     throw new Error(
-      'Web Bluetooth is not supported in this browser. Use Chrome on Android/Desktop, or use System 58mm Print.'
+      'Web Bluetooth is not supported in this browser. Open in Google Chrome on Android/Desktop, or connect via USB/COM Serial or Android RawBT.'
     );
   }
 
-  const device = await nav.bluetooth.requestDevice({
-    acceptAllDevices: true,
-    optionalServices: THERMAL_PRINTER_SERVICES,
-  });
+  let device: any;
+  try {
+    device = await nav.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: THERMAL_PRINTER_SERVICES,
+    });
+  } catch (err: any) {
+    const msg = String(err?.message || err || '');
+    if (err?.name === 'SecurityError' || msg.toLowerCase().includes('permissions policy')) {
+      throw new Error(
+        'Bluetooth scanning is blocked inside the embedded preview frame. Click "Open Full Admin Tab" to pair your Bluetooth printer directly.'
+      );
+    }
+    if (err?.name === 'NotFoundError') {
+      throw new Error(
+        'No BLE printer selected/found. Note: Many 58mm printers (RPP02N, MTP-2, ZJ-58, POS-58) use Classic Bluetooth SPP, which does not show in Chrome BLE scan — use "USB / BT Serial COM" on PC or "Android RawBT Mode" on phone!'
+      );
+    }
+    throw err;
+  }
 
   const server = await device.gatt.connect();
   const services = await server.getPrimaryServices();
@@ -80,7 +175,7 @@ export async function connectBluetooth58mmPrinter(): Promise<string> {
 
   if (!writeChar) {
     throw new Error(
-      'Connected to Bluetooth device, but no ESC/POS writable print characteristic was found.'
+      'Connected to Bluetooth device, but no ESC/POS writable GATT print characteristic was found. If this is a Classic Bluetooth SPP printer, use USB/BT Serial COM or Android RawBT mode.'
     );
   }
 
@@ -88,12 +183,13 @@ export async function connectBluetooth58mmPrinter(): Promise<string> {
     activePrinterSession = null;
   });
 
-  const deviceName = device.name || '58mm Thermal Printer';
+  const deviceName = device.name || '58mm BLE Thermal Printer';
   activePrinterSession = {
     device,
     characteristic: writeChar,
     deviceName,
   };
+  setRawBtModeEnabled(false);
 
   try {
     localStorage.setItem('makarem_printer_name', deviceName);
@@ -102,6 +198,54 @@ export async function connectBluetooth58mmPrinter(): Promise<string> {
   }
 
   return deviceName;
+}
+
+/**
+ * Connects via Web Serial API (USB Thermal Printer OR Windows/Mac paired Classic Bluetooth COM port!).
+ */
+export async function connectSerial58mmPrinter(baudRate = 9600): Promise<string> {
+  const nav = navigator as any;
+  if (!nav?.serial) {
+    throw new Error(
+      'Web Serial is not supported on this device/browser. On Android phone, enable "Android RawBT Mode" for Classic Bluetooth 58mm printing.'
+    );
+  }
+
+  let port: any;
+  try {
+    port = await nav.serial.requestPort();
+  } catch (err: any) {
+    const msg = String(err?.message || err || '');
+    if (err?.name === 'SecurityError' || msg.toLowerCase().includes('permissions policy')) {
+      throw new Error(
+        'Serial port access is blocked inside the preview frame. Open Admin in a standalone browser tab first.'
+      );
+    }
+    throw err;
+  }
+
+  await port.open({ baudRate });
+  const info = port.getInfo?.() || {};
+  const label = info.usbProductId
+    ? `58mm USB/Serial (${info.usbProductId})`
+    : `58mm Serial COM (${baudRate})`;
+
+  activeSerialSession = {
+    port,
+    deviceName: label,
+    baudRate,
+  };
+  setRawBtModeEnabled(false);
+  return label;
+}
+
+async function writeSerialEscPos(port: any, data: Uint8Array): Promise<void> {
+  const writer = port.writable.getWriter();
+  try {
+    await writer.write(data);
+  } finally {
+    writer.releaseLock();
+  }
 }
 
 async function writeBleChunks(characteristic: any, data: Uint8Array): Promise<void> {
@@ -115,6 +259,26 @@ async function writeBleChunks(characteristic: any, data: Uint8Array): Promise<vo
     }
     await new Promise((r) => setTimeout(r, 12));
   }
+}
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+
+function sendViaAndroidRawBT(packet: Uint8Array): void {
+  const base64 = uint8ToBase64(packet);
+  const link = document.createElement('a');
+  link.href = `rawbt:base64,${base64}`;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  setTimeout(() => link.remove(), 500);
 }
 
 /**
@@ -338,18 +502,30 @@ export function printOrderVia58mmBrowserDialog(order: Order, language: 'en' | 'a
 }
 
 /**
- * Prints an order to the connected 58mm Bluetooth thermal printer if connected,
+ * Prints an order to the connected 58mm Bluetooth / Serial / RawBT printer,
  * or falls back cleanly to system 58mm thermal print dialog when requested.
  */
 export async function printOrderTo58mmPrinter(
   order: Order,
   language: 'en' | 'ar' = 'ar',
   allowBrowserFallback = true
-): Promise<'bluetooth' | 'browser' | 'skipped'> {
+): Promise<PrinterTransportMode | 'skipped'> {
   if (activePrinterSession?.device?.gatt?.connected && activePrinterSession.characteristic) {
     const packet = buildOrderReceiptBitmapEscPos(order, language);
     await writeBleChunks(activePrinterSession.characteristic, packet);
     return 'bluetooth';
+  }
+
+  if (activeSerialSession?.port?.writable) {
+    const packet = buildOrderReceiptBitmapEscPos(order, language);
+    await writeSerialEscPos(activeSerialSession.port, packet);
+    return 'serial';
+  }
+
+  if (rawbtModeEnabled) {
+    const packet = buildOrderReceiptBitmapEscPos(order, language);
+    sendViaAndroidRawBT(packet);
+    return 'rawbt';
   }
 
   if (allowBrowserFallback) {
@@ -360,11 +536,7 @@ export async function printOrderTo58mmPrinter(
   return 'skipped';
 }
 
-export async function printTest58mmBluetoothSlip(): Promise<void> {
-  if (!activePrinterSession?.device?.gatt?.connected || !activePrinterSession.characteristic) {
-    throw new Error('Printer is not connected');
-  }
-
+export async function printTest58mmBluetoothSlip(): Promise<PrinterTransportMode> {
   const testOrder: Order = {
     id: 'test-print',
     orderNumber: 'MAK-TEST',
@@ -395,6 +567,24 @@ export async function printTest58mmBluetoothSlip(): Promise<void> {
     updatedAt: new Date().toISOString(),
   };
 
-  const packet = buildOrderReceiptBitmapEscPos(testOrder, 'ar');
-  await writeBleChunks(activePrinterSession.characteristic, packet);
+  if (activePrinterSession?.device?.gatt?.connected && activePrinterSession.characteristic) {
+    const packet = buildOrderReceiptBitmapEscPos(testOrder, 'ar');
+    await writeBleChunks(activePrinterSession.characteristic, packet);
+    return 'bluetooth';
+  }
+
+  if (activeSerialSession?.port?.writable) {
+    const packet = buildOrderReceiptBitmapEscPos(testOrder, 'ar');
+    await writeSerialEscPos(activeSerialSession.port, packet);
+    return 'serial';
+  }
+
+  if (rawbtModeEnabled) {
+    const packet = buildOrderReceiptBitmapEscPos(testOrder, 'ar');
+    sendViaAndroidRawBT(packet);
+    return 'rawbt';
+  }
+
+  printOrderVia58mmBrowserDialog(testOrder, 'ar');
+  return 'browser';
 }

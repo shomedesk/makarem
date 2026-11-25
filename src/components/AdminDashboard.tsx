@@ -59,11 +59,16 @@ import { fetchAllSettlementsForAdmin } from '../services/creditSettlementService
 import { playNewOrderChime } from '../utils/audio';
 import {
   connectBluetooth58mmPrinter,
+  connectSerial58mmPrinter,
   disconnectBluetoothPrinter,
   getConnectedPrinterName,
+  isRawBtModeEnabled,
+  isRunningInsideIframe,
   isWebBluetoothSupported,
+  isWebSerialSupported,
   printOrderTo58mmPrinter,
   printTest58mmBluetoothSlip,
+  setRawBtModeEnabled,
 } from '../utils/thermalPrinter';
 import { ImageUploadModal } from './ImageUploadModal';
 import { QrBarcodeScannerModal } from './QrBarcodeScannerModal';
@@ -76,10 +81,13 @@ interface AdminDashboardProps {
     totalItems: number;
     translatedNew: number;
     translationError?: string;
+    pushedToDevices?: boolean;
   }>;
   onUpdateProductImage?: (productId: string, imageUrl: string) => void;
   autoPrintEnabled: boolean;
   onToggleAutoPrint: (enabled: boolean) => void;
+  whatsappNumber: string;
+  onSaveWhatsAppNumber: (phone: string) => Promise<string>;
   language: 'en' | 'ar';
   salesplayShop: SalesPlayShop | null;
 }
@@ -91,6 +99,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onUpdateProductImage,
   autoPrintEnabled,
   onToggleAutoPrint,
+  whatsappNumber,
+  onSaveWhatsAppNumber,
   language,
   salesplayShop,
 }) => {
@@ -119,11 +129,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [isRefreshingSync, setIsRefreshingSync] = useState(false);
   const [syncBannerMsg, setSyncBannerMsg] = useState<string | null>(null);
 
-  // 58mm Bluetooth Printer state
+  // 58mm Thermal Printer state
   const [printerName, setPrinterName] = useState<string | null>(() => getConnectedPrinterName());
   const [isConnectingPrinter, setIsConnectingPrinter] = useState(false);
   const [printerMsg, setPrinterMsg] = useState<string | null>(null);
   const [printingOrderId, setPrintingOrderId] = useState<string | null>(null);
+
+  // Store WhatsApp Support Number editor state
+  const [waInput, setWaInput] = useState<string>(whatsappNumber);
+  const [isSavingWa, setIsSavingWa] = useState(false);
+  const [waStatusMsg, setWaStatusMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    setWaInput(whatsappNumber);
+  }, [whatsappNumber]);
 
   // Customers Management Tab state
   const [customers, setCustomers] = useState<AdminCustomerRecord[]>([]);
@@ -219,7 +238,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setQrDataUrl('');
       return;
     }
-    const profileUrl = `${window.location.origin}/profile?cid=${encodeURIComponent(
+    const profileUrl = `${window.location.origin}/profile/${encodeURIComponent(
       qrCardCustomer.customerCode
     )}`;
     QRCode.toDataURL(profileUrl, {
@@ -425,27 +444,52 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setSyncBannerMsg(null);
     try {
       const res = await onRefreshAndTranslateCatalog();
+      const pushNote = res.pushedToDevices
+        ? isAr
+          ? ' وتم إرسال التحديث لجميع أجهزة العملاء!'
+          : ' & pushed to all customer devices!'
+        : '';
+
       if (res.translationError) {
         setSyncBannerMsg(
           isAr
-            ? `تم تحديث ${res.totalItems} صنف. ملاحظة الترجمة: ${res.translationError}`
-            : `Synced ${res.totalItems} items. Translation notice: ${res.translationError}`
+            ? `تم تحديث ${res.totalItems} صنف${pushNote}. ملاحظة الترجمة: ${res.translationError}`
+            : `Synced ${res.totalItems} items${pushNote}. Translation notice: ${res.translationError}`
         );
       } else if (res.translatedNew > 0) {
         setSyncBannerMsg(
           isAr
-            ? `تم تحديث ${res.totalItems} صنف وترجمة ${res.translatedNew} صنف جديد للعربية!`
-            : `Synced ${res.totalItems} items and translated ${res.translatedNew} new item(s) to Arabic!`
+            ? `تم تحديث ${res.totalItems} صنف وترجمة ${res.translatedNew} صنف جديد${pushNote}`
+            : `Synced ${res.totalItems} items & translated ${res.translatedNew} new item(s)${pushNote}`
         );
       } else {
         setSyncBannerMsg(
           isAr
-            ? `تم تحديث ${res.totalItems} صنف من المتجر بنجاح.`
-            : `Synced ${res.totalItems} live items from store.`
+            ? `تم تحديث ${res.totalItems} صنف من المتجر${pushNote}`
+            : `Synced ${res.totalItems} live items${pushNote}`
         );
       }
     } finally {
       setIsRefreshingSync(false);
+    }
+  };
+
+  const handleSaveWhatsAppSetting = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSavingWa(true);
+    setWaStatusMsg(null);
+    try {
+      const saved = await onSaveWhatsAppNumber(waInput);
+      setWaStatusMsg(
+        isAr
+          ? `تم حفظ رقم الواتساب (${saved}) لجميع العملاء بنجاح.`
+          : `Saved store WhatsApp number (${saved}) for all customers.`
+      );
+      setTimeout(() => setWaStatusMsg(null), 4000);
+    } catch (err: any) {
+      setWaStatusMsg(err?.message || 'Could not save WhatsApp number');
+    } finally {
+      setIsSavingWa(false);
     }
   };
 
@@ -456,7 +500,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const name = await connectBluetooth58mmPrinter();
       setPrinterName(name);
       setPrinterMsg(
-        isAr ? `تم توصيل الطابعة: ${name}` : `Connected 58mm Printer: ${name}`
+        isAr ? `تم توصيل الطابعة: ${name}` : `Connected 58mm BLE Printer: ${name}`
       );
     } catch (err: any) {
       setPrinterMsg(err?.message || 'Could not connect Bluetooth printer');
@@ -465,18 +509,51 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }
   };
 
+  const handleConnectSerialPrinter = async () => {
+    setIsConnectingPrinter(true);
+    setPrinterMsg(null);
+    try {
+      const name = await connectSerial58mmPrinter(9600);
+      setPrinterName(name);
+      setPrinterMsg(
+        isAr ? `تم توصيل الطابعة عبر المنفذ: ${name}` : `Connected 58mm Serial Printer: ${name}`
+      );
+    } catch (err: any) {
+      setPrinterMsg(err?.message || 'Could not connect Serial/COM printer');
+    } finally {
+      setIsConnectingPrinter(false);
+    }
+  };
+
+  const handleToggleRawBtMode = () => {
+    const next = !isRawBtModeEnabled();
+    setRawBtModeEnabled(next);
+    setPrinterName(getConnectedPrinterName());
+    setPrinterMsg(
+      next
+        ? isAr
+          ? 'تم تفعيل وضع Android RawBT للطباعة عبر البلوتوث الكلاسيكي 58mm.'
+          : 'Android RawBT mode enabled! Clicking Print will send ESC/POS straight to your paired 58mm Classic Bluetooth printer via RawBT.'
+        : isAr
+        ? 'تم إيقاف وضع Android RawBT'
+        : 'Android RawBT mode turned off'
+    );
+  };
+
   const handleDisconnectPrinter = () => {
     disconnectBluetoothPrinter();
     setPrinterName(null);
     onToggleAutoPrint(false);
-    setPrinterMsg(isAr ? 'تم فصل الطابعة' : 'Bluetooth printer disconnected');
+    setPrinterMsg(isAr ? 'تم فصل الطابعة' : 'Printer disconnected');
   };
 
   const handleTestPrinter = async () => {
     setPrinterMsg(null);
     try {
-      await printTest58mmBluetoothSlip();
-      setPrinterMsg(isAr ? 'تم إرسال فاتورة تجريبية 58mm' : 'Sent test 58mm thermal slip');
+      const mode = await printTest58mmBluetoothSlip();
+      setPrinterMsg(
+        isAr ? `تم إرسال فاتورة تجريبية (${mode})` : `Sent test 58mm thermal slip via ${mode}`
+      );
     } catch (err: any) {
       setPrinterMsg(err?.message || 'Test print failed');
     }
@@ -702,95 +779,135 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </button>
       </div>
 
-      {/* 58mm Bluetooth Thermal Printer Bar */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-3.5 sm:p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div
-            className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-              printerName
-                ? 'bg-emerald-100 text-emerald-800'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            {printerName ? (
-              <BluetoothConnected className="w-5 h-5" />
+      {/* 58mm Bluetooth / Serial / RawBT Thermal Printer Bar */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-3.5 sm:p-4 space-y-2.5">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div
+              className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                printerName
+                  ? 'bg-emerald-100 text-emerald-800'
+                  : 'bg-slate-100 text-slate-600'
+              }`}
+            >
+              {printerName ? (
+                <BluetoothConnected className="w-5 h-5" />
+              ) : (
+                <Printer className="w-5 h-5" />
+              )}
+            </div>
+            <div>
+              <div className="text-xs sm:text-sm font-extrabold text-slate-900">
+                {printerName
+                  ? isAr
+                    ? `طابعة 58mm جاهزة: ${printerName}`
+                    : `58mm Printer Ready: ${printerName}`
+                  : isAr
+                  ? 'طابعة الفواتير الحرارية 58mm (بلوتوث / USB)'
+                  : '58mm Thermal Printer (Bluetooth / USB / RawBT)'}
+              </div>
+              <div className="text-[11px] text-slate-500">
+                {isRunningInsideIframe()
+                  ? isAr
+                    ? 'تنبيه: المتصفح يحظر البلوتوث داخل إطار المعاينة — افتح صفحة الإدارة في تبويب مستقل للاتصال.'
+                    : 'Preview frame blocks Web Bluetooth — open Admin in a standalone tab to scan & pair.'
+                  : isWebBluetoothSupported()
+                  ? isAr
+                    ? 'يدعم بلوتوث BLE، ومنافذ USB/BT COM على الكمبيوتر، وتطبيق RawBT لطابعات البلوتوث على الأندرويد.'
+                    : 'Supports BLE Bluetooth, USB/Paired BT Serial (PC), & Android RawBT (Classic BT like RPP02N / MTP-2).'
+                  : isAr
+                  ? 'يمكنك استخدام Android RawBT أو الطباعة الحرارية 58mm للنظام مباشرة.'
+                  : 'Use Android RawBT mode (Classic BT) or 58mm System Print.'}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {isRunningInsideIframe() && (
+              <a
+                href={typeof window !== 'undefined' ? window.location.href : '/'}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-100 hover:bg-amber-200 border border-amber-300 text-amber-950 text-xs font-extrabold"
+              >
+                <span>{isAr ? 'فتح في تبويب مستقل للبلوتوث' : 'Open Full Tab for BT'}</span>
+              </a>
+            )}
+
+            {!printerName ? (
+              <>
+                <button
+                  type="button"
+                  onClick={handleConnectPrinter}
+                  disabled={isConnectingPrinter}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-bold transition cursor-pointer disabled:opacity-60"
+                >
+                  {isConnectingPrinter ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Bluetooth className="w-3.5 h-3.5 text-sky-400" />
+                  )}
+                  <span>{isAr ? 'بلوتوث BLE 58mm' : 'Connect BLE BT'}</span>
+                </button>
+
+                {isWebSerialSupported() && (
+                  <button
+                    type="button"
+                    onClick={handleConnectSerialPrinter}
+                    disabled={isConnectingPrinter}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-300 text-slate-800 text-xs font-bold transition cursor-pointer disabled:opacity-60"
+                  >
+                    <Printer className="w-3.5 h-3.5 text-emerald-700" />
+                    <span>{isAr ? 'USB / منفذ COM' : 'USB / BT Serial COM'}</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleToggleRawBtMode}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-900 text-xs font-bold transition cursor-pointer"
+                >
+                  <Smartphone className="w-3.5 h-3.5 text-emerald-700" />
+                  <span>{isAr ? 'تفعيل Android RawBT' : 'Android RawBT (Classic BT)'}</span>
+                </button>
+              </>
             ) : (
-              <Printer className="w-5 h-5" />
+              <>
+                <label className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoPrintEnabled}
+                    onChange={(e) => onToggleAutoPrint(e.target.checked)}
+                    className="accent-emerald-700 w-3.5 h-3.5"
+                  />
+                  <span>{isAr ? 'طباعة تلقائية للطلب الجديد' : 'Auto-Print New Orders'}</span>
+                </label>
+
+                <button
+                  type="button"
+                  onClick={handleTestPrinter}
+                  className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold cursor-pointer"
+                >
+                  {isAr ? 'طباعة تجريبية' : 'Test 58mm'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleDisconnectPrinter}
+                  className="px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold cursor-pointer"
+                >
+                  {isAr ? 'فصل' : 'Disconnect'}
+                </button>
+              </>
             )}
           </div>
-          <div>
-            <div className="text-xs sm:text-sm font-extrabold text-slate-900">
-              {printerName
-                ? isAr
-                  ? `طابعة 58mm متصلة: ${printerName}`
-                  : `58mm Printer Connected: ${printerName}`
-                : isAr
-                ? 'طابعة الفواتير الحرارية 58mm (بلوتوث)'
-                : '58mm Bluetooth Thermal Printer'}
-            </div>
-            <div className="text-[11px] text-slate-500">
-              {isWebBluetoothSupported()
-                ? isAr
-                  ? 'اتصال بلوتوث مباشر لطباعة أي طلب (مع طباعة تلقائية للطلبات الجديدة)'
-                  : 'Connect directly via Bluetooth ESC/POS for instant 58mm order receipts'
-                : isAr
-                ? 'المتصفح الحالي سيستخدم نافذة طباعة 58mm التلقائية للنظام'
-                : 'Web Bluetooth unavailable here — clicking Print uses crisp 58mm system thermal print'}
-            </div>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {!printerName ? (
-            <button
-              type="button"
-              onClick={handleConnectPrinter}
-              disabled={isConnectingPrinter}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-bold transition cursor-pointer disabled:opacity-60"
-            >
-              {isConnectingPrinter ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Bluetooth className="w-3.5 h-3.5 text-sky-400" />
-              )}
-              <span>{isAr ? 'ربط طابعة 58mm بلوتوث' : 'Connect 58mm BT Printer'}</span>
-            </button>
-          ) : (
-            <>
-              <label className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={autoPrintEnabled}
-                  onChange={(e) => onToggleAutoPrint(e.target.checked)}
-                  className="accent-emerald-700 w-3.5 h-3.5"
-                />
-                <span>{isAr ? 'طباعة تلقائية للطلب الجديد' : 'Auto-Print New Orders'}</span>
-              </label>
-
-              <button
-                type="button"
-                onClick={handleTestPrinter}
-                className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold cursor-pointer"
-              >
-                {isAr ? 'طباعة تجريبية' : 'Test 58mm'}
-              </button>
-
-              <button
-                type="button"
-                onClick={handleDisconnectPrinter}
-                className="px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold cursor-pointer"
-              >
-                {isAr ? 'فصل' : 'Disconnect'}
-              </button>
-            </>
-          )}
         </div>
       </div>
 
       {printerMsg && (
-        <div className="p-3 rounded-xl bg-sky-50 border border-sky-200 text-sky-900 text-xs font-bold flex items-center justify-between">
+        <div className="p-3 rounded-xl bg-sky-50 border border-sky-200 text-sky-900 text-xs font-bold flex items-center justify-between gap-2">
           <span>{printerMsg}</span>
-          <button type="button" onClick={() => setPrinterMsg(null)} className="cursor-pointer">
+          <button type="button" onClick={() => setPrinterMsg(null)} className="cursor-pointer shrink-0">
             ✕
           </button>
         </div>
@@ -878,23 +995,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </button>
         </div>
 
-        {/* Refresh & Audio Controls */}
+        {/* Sync to Customer Devices & Audio Controls */}
         <div className="flex items-center gap-2 self-end sm:self-auto">
           <button
             type="button"
             onClick={handleRefreshAndTranslate}
             disabled={isRefreshingSync}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white transition cursor-pointer disabled:opacity-60 whitespace-nowrap"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white transition cursor-pointer disabled:opacity-60 whitespace-nowrap shadow-2xs"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSync ? 'animate-spin' : ''}`} />
             <span>
               {isRefreshingSync
                 ? isAr
-                  ? 'جاري التحديث والترجمة...'
-                  : 'Syncing & Translating...'
+                  ? 'جاري التحديث والإرسال...'
+                  : 'Syncing & Pushing...'
                 : isAr
-                ? 'تحديث وترجمة الأصناف'
-                : 'Refresh & Update Items'}
+                ? 'مزامنة وإرسال لأجهزة العملاء'
+                : 'Sync to Customer Devices'}
             </span>
           </button>
 
@@ -1836,11 +1953,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <span>
                   {isRefreshingSync
                     ? isAr
-                      ? 'جاري التحديث والترجمة...'
-                      : 'Updating & Translating...'
+                      ? 'جاري المزامنة والإرسال...'
+                      : 'Syncing & Pushing...'
                     : isAr
-                    ? 'تحديث وترجمة الأصناف'
-                    : 'Refresh & Update Items'}
+                    ? 'مزامنة وإرسال لأجهزة العملاء'
+                    : 'Sync to Customer Devices'}
                 </span>
               </button>
             </div>
@@ -2047,47 +2164,101 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* TAB 4: SALESPLAY LIVE SYNC INFO */}
+      {/* TAB 4: SALESPLAY LIVE SYNC & STORE WHATSAPP SETTINGS */}
       {activeTab === 'salesplay' && (
-        <div className="bg-white rounded-2xl p-5 border border-slate-200 space-y-5">
-          <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
-            <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center">
-              <Zap className="w-5 h-5" />
+        <div className="space-y-4">
+          <div className="bg-white rounded-2xl p-5 border border-slate-200 space-y-5">
+            <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
+              <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center">
+                <Zap className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-base text-slate-900">
+                  {isAr ? 'تكامل SalesPlay POS (قراءة الأصناف والفواتير فقط)' : 'SalesPlay Cloud POS (Read-Only Catalog & Credit Sync)'}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {isAr
+                    ? 'الطلبات الإلكترونية لا تغيّر مخزون SalesPlay — الفوترة النهائية تتم داخل جهاز POS بالمحل.'
+                    : 'Online orders never modify SalesPlay stock or receipts — final billing happens inside SalesPlay POS.'}
+                </p>
+              </div>
             </div>
-            <div>
-              <h3 className="font-bold text-base text-slate-900">
-                {isAr ? 'تكامل SalesPlay POS (قراءة الأصناف والفواتير فقط)' : 'SalesPlay Cloud POS (Read-Only Catalog & Credit Sync)'}
-              </h3>
-              <p className="text-xs text-slate-500">
-                {isAr
-                  ? 'الطلبات الإلكترونية لا تغيّر مخزون SalesPlay — الفوترة النهائية تتم داخل جهاز POS بالمحل.'
-                  : 'Online orders never modify SalesPlay stock or receipts — final billing happens inside SalesPlay POS.'}
-              </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
+                <span className="font-bold text-slate-500 uppercase tracking-wider block">
+                  {isAr ? 'اسم المتجر' : 'Shop Name'}
+                </span>
+                <div className="font-extrabold text-sm text-slate-900">
+                  {salesplayShop?.shop_name || 'MAKAREM ALKHAIR MODERN'}
+                </div>
+                <div className="text-[11px] text-slate-500 font-mono">
+                  Synced Items: {catalog.length}
+                </div>
+              </div>
+
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
+                <span className="font-bold text-slate-500 uppercase tracking-wider block">
+                  {isAr ? 'وضع المزامنة الاقتصادي' : 'Push-Triggered Customer Sync'}
+                </span>
+                <div className="font-bold text-emerald-700">Admin Push Sync (Zero Wasted Reads)</div>
+                <div className="text-[11px] text-slate-600">
+                  {isAr
+                    ? 'أجهزة العملاء تتحدث مرة واحدة فقط بعد ضغط "مزامنة وإرسال لأجهزة العملاء".'
+                    : 'Customer apps pull updated items & categories once whenever you click Sync to Customer Devices.'}
+                </div>
+              </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
-              <span className="font-bold text-slate-500 uppercase tracking-wider block">
-                {isAr ? 'اسم المتجر' : 'Shop Name'}
-              </span>
-              <div className="font-extrabold text-sm text-slate-900">
-                {salesplayShop?.shop_name || 'MAKAREM ALKHAIR MODERN'}
+          {/* Customer Floating WhatsApp Number Setting */}
+          <div className="bg-white rounded-2xl p-5 border border-slate-200 space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
+              <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center border border-emerald-200">
+                <Phone className="w-5 h-5" />
               </div>
-              <div className="text-[11px] text-slate-500 font-mono">
-                Synced Items: {catalog.length}
+              <div>
+                <h3 className="font-bold text-base text-slate-900">
+                  {isAr ? 'رقم واتساب خدمة العملاء (الزر العائم)' : 'Customer WhatsApp Support Number'}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {isAr
+                    ? 'الرقم المستخدم في زر الواتساب العائم بزاوية الشاشة ليتواصل العملاء مع البقالة مباشرة.'
+                    : 'Phone number linked to the floating corner WhatsApp chat button visible to customers.'}
+                </p>
               </div>
             </div>
 
-            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
-              <span className="font-bold text-slate-500 uppercase tracking-wider block">
-                {isAr ? 'وضع المزامنة الذكي' : 'Smart Quota Mode'}
-              </span>
-              <div className="font-bold text-emerald-700">Delta Catalog + Daily Meta Cache</div>
-              <div className="text-[11px] text-slate-600">
-                Minimal Firestore reads (max 1 metadata check/day per customer)
+            <form onSubmit={handleSaveWhatsAppSetting} className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-end">
+              <div className="flex-1">
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  {isAr ? 'رقم الواتساب (عماني 8 أرقام أو دولي)' : 'WhatsApp Phone Number'}
+                </label>
+                <input
+                  type="tel"
+                  required
+                  value={waInput}
+                  onChange={(e) => setWaInput(e.target.value)}
+                  placeholder="72095796"
+                  className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl font-mono font-bold focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-emerald-600/30"
+                />
               </div>
-            </div>
+
+              <button
+                type="submit"
+                disabled={isSavingWa}
+                className="px-5 py-2.5 rounded-xl bg-[#25D366] hover:bg-[#1EBE5D] text-white font-extrabold text-xs transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+              >
+                {isSavingWa && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{isAr ? 'حفظ رقم الواتساب' : 'Save WhatsApp Number'}</span>
+              </button>
+            </form>
+
+            {waStatusMsg && (
+              <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold">
+                {waStatusMsg}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2229,7 +2400,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 )}
 
                 <div className="text-[10px] text-slate-500 font-mono break-all">
-                  {`${window.location.origin}/profile?cid=${qrCardCustomer.customerCode}`}
+                  {`${window.location.origin}/profile/${qrCardCustomer.customerCode}`}
                 </div>
               </div>
 

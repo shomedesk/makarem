@@ -52,6 +52,8 @@ interface CustomerProfilePageProps {
   onLogout: () => void;
   onBackToShop: () => void;
   onTrackOrder: (order: Order) => void;
+  isAutoLoggingIn?: boolean;
+  autoLoginError?: string | null;
   language: 'en' | 'ar';
 }
 
@@ -61,6 +63,8 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
   onLogout,
   onBackToShop,
   onTrackOrder,
+  isAutoLoggingIn = false,
+  autoLoginError = null,
   language,
 }) => {
   const isAr = language === 'ar';
@@ -240,6 +244,22 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
     setExpandedBills((prev) => ({ ...prev, [billNo]: !prev[billNo] }));
   };
 
+  if (isAutoLoggingIn) {
+    return (
+      <div className="max-w-md mx-auto py-16 text-center space-y-3 bg-white rounded-3xl border border-slate-200 p-8 shadow-sm">
+        <Loader2 className="w-8 h-8 animate-spin mx-auto text-emerald-700" />
+        <h2 className="font-extrabold text-base text-slate-900">
+          {isAr ? 'جاري فتح حساب العميل...' : 'Opening Customer Profile...'}
+        </h2>
+        <p className="text-xs text-slate-500">
+          {isAr
+            ? 'يرجى الانتظار لحظة، جاري التحقق من بطاقة العائلة والفواتير.'
+            : 'Verifying your Family Card ID and loading bills...'}
+        </p>
+      </div>
+    );
+  }
+
   if (!profile) {
     return (
       <div className="max-w-md mx-auto py-8 space-y-6">
@@ -303,10 +323,10 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
                 </div>
               </div>
 
-              {loginError && (
+              {(loginError || autoLoginError) && (
                 <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-bold flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <span>{loginError}</span>
+                  <span>{loginError || autoLoginError}</span>
                 </div>
               )}
 

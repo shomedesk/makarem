@@ -217,11 +217,24 @@ service cloud.firestore {
       allow delete: if isValidId(customerCode) && isAdmin();
     }
 
+    function isValidStoreSetting(data) {
+      return data.keys().hasOnly([
+          'houseDeliveryEnabled', 'whatsappNumber', 'catalogSyncVersion',
+          'itemCount', 'itemsSerialized', 'updatedAt'
+        ])
+        && (!('houseDeliveryEnabled' in data) || data.houseDeliveryEnabled is bool)
+        && (!('whatsappNumber' in data) || (data.whatsappNumber is string && data.whatsappNumber.size() <= 30))
+        && (!('catalogSyncVersion' in data) || (data.catalogSyncVersion is string && data.catalogSyncVersion.size() <= 64))
+        && (!('itemCount' in data) || (data.itemCount is int && data.itemCount >= 0 && data.itemCount <= 50000))
+        && (!('itemsSerialized' in data) || (data.itemsSerialized is string && data.itemsSerialized.size() <= 900000))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
     // Store Settings
     match /store_settings/{settingId} {
       allow get: if isValidId(settingId);
       allow list: if isAdmin();
-      allow create, update: if isValidId(settingId) && isAdmin();
+      allow create, update: if isValidId(settingId) && isAdmin() && isValidStoreSetting(incoming());
       allow delete: if isValidId(settingId) && isAdmin();
     }
 

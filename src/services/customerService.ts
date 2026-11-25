@@ -161,10 +161,13 @@ export async function loginOrRegisterCustomer(
   }
 
   const normDigits = normalizePhoneNumber(raw);
-  const looksLikeCode = /^\d{1,5}$/.test(raw) && raw.length <= 5;
+  const isOmaniMobile = /^(7|9)\d{7}$/.test(normDigits);
+  const looksLikeCode =
+    !isOmaniMobile &&
+    ((/^\d{1,6}$/.test(raw) && raw.length <= 6) || /^[a-zA-Z0-9_-]{1,12}$/.test(raw) && /[a-zA-Z]/.test(raw));
 
   if (looksLikeCode) {
-    const paddedCode = raw.length <= 3 ? formatCustomerCode(Number(raw)) : raw;
+    const paddedCode = /^\d{1,3}$/.test(raw) ? formatCustomerCode(Number(raw)) : raw;
 
     // 1. Check Firestore by customerCode
     for (const candidateCode of Array.from(new Set([paddedCode, raw]))) {

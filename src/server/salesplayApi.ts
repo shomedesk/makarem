@@ -49,7 +49,7 @@ export function getSyncLogs() {
  * SalesPlay POS REST API expects parameters (limit, cursor, created_at_min, etc.)
  * as a JSON body even on GET requests. Node's native https.request supports GET + body.
  */
-function salesplayRequest(
+function salesplayRequestOnce(
   endpoint: string,
   method: 'GET' | 'POST' | 'PUT' = 'GET',
   bodyObj?: Record<string, any> | null
@@ -94,7 +94,7 @@ function salesplayRequest(
     );
 
     req.on('error', reject);
-    req.setTimeout(15000, () => {
+    req.setTimeout(25000, () => {
       req.destroy(new Error(`SalesPlay request timeout on ${endpoint}`));
     });
     if (body) {
@@ -102,6 +102,24 @@ function salesplayRequest(
     }
     req.end();
   });
+}
+
+async function salesplayRequest(
+  endpoint: string,
+  method: 'GET' | 'POST' | 'PUT' = 'GET',
+  bodyObj?: Record<string, any> | null
+): Promise<{ status: number; ok: boolean; data: any }> {
+  try {
+    const first = await salesplayRequestOnce(endpoint, method, bodyObj);
+    if (first.status >= 500) {
+      await new Promise((r) => setTimeout(r, 400));
+      return await salesplayRequestOnce(endpoint, method, bodyObj);
+    }
+    return first;
+  } catch (err) {
+    await new Promise((r) => setTimeout(r, 400));
+    return await salesplayRequestOnce(endpoint, method, bodyObj);
+  }
 }
 
 async function fetchAllPaginated<T>(

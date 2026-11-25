@@ -56,11 +56,27 @@ export const ShopStorefront: React.FC<ShopStorefrontProps> = ({
       }
     }
 
-    // Put named categories sorted by product count, and place Uncategorized clearly at the end
+    const getCategoryPriorityRank = (catName: string): number => {
+      const lower = catName.trim().toLowerCase();
+      if (lower === 'snacks') return 1;
+      if (lower === 'heavy snacks') return 2;
+      if (lower === 'chips') return 3;
+      if (lower === 'drink' || lower === 'drinks') return 4;
+      if (lower === 'milk & dairy items' || lower === 'milk & dairy' || lower === 'dairy') return 5;
+      if (lower === 'water') return 6;
+      if (lower === 'icecream' || lower === 'ice cream') return 7;
+      if (lower === 'grocery') return 8;
+      if (lower === 'other') return 98;
+      if (lower === 'uncategorized') return 99;
+      return 20;
+    };
+
+    // Sort: Snacks -> Heavy Snacks -> Chips -> Drinks -> Milk & Dairy -> rest by count -> Uncategorized last
     return Object.entries(counts)
       .sort((a, b) => {
-        if (a[0] === 'Uncategorized') return 1;
-        if (b[0] === 'Uncategorized') return -1;
+        const rankA = getCategoryPriorityRank(a[0]);
+        const rankB = getCategoryPriorityRank(b[0]);
+        if (rankA !== rankB) return rankA - rankB;
         return b[1] - a[1];
       })
       .map(([name, count]) => ({
@@ -69,7 +85,7 @@ export const ShopStorefront: React.FC<ShopStorefrontProps> = ({
         labelAr:
           name === 'Uncategorized'
             ? 'غير مصنف'
-            : arNames[name] || CATEGORY_ARABIC_MAP[name] || name,
+            : CATEGORY_ARABIC_MAP[name] || arNames[name] || name,
         count,
       }));
   }, [catalog]);

@@ -1,4 +1,5 @@
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -12,10 +13,18 @@ const __dirname = path.dirname(__filename);
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
-  const isProd = process.env.NODE_ENV === 'production';
+  const distPath = path.resolve(__dirname, 'dist');
+  const distIndex = path.join(distPath, 'index.html');
+  const isProd =
+    process.env.NODE_ENV === 'production' ||
+    (process.env.NODE_ENV !== 'development' && fs.existsSync(distIndex));
 
   // Parse JSON payloads
   app.use(express.json());
+
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, mode: isProd ? 'production' : 'development', timestamp: new Date().toISOString() });
+  });
 
   // Mount SalesPlay POS proxy endpoints (works in both dev & live production)
   app.all('/api/salesplay/*', async (req, res, next) => {
@@ -42,24 +51,26 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     // Production mode: serve built assets from dist
-    const distPath = path.resolve(__dirname, 'dist');
     app.use(
       express.static(distPath, {
         setHeaders: (res, filePath) => {
-          if (filePath.endsWith('index.html') || filePath.endsWith('sw.js')) {
+          if (filePath.endsWith('index.html') || filePath.endsWith('sw.js') || filePath.endsWith('registerSW.js')) {
             res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+          } else if (filePath.endsWith('manifest.webmanifest')) {
+            res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
           }
         },
       })
     );
 
-    // Fallback all frontend routes (e.g. /, /profile) to index.html for SPA
+    // Fallback all frontend routes (e.g. /, /profile, /profile/001) to index.html for SPA
     app.get('*', (req, res, next) => {
       if (req.url.startsWith('/api')) {
         return next();
       }
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-      res.sendFile(path.resolve(distPath, 'index.html'));
+      res.sendFile(distIndex);
     });
   }
 
