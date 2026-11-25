@@ -1,0 +1,248 @@
+{
+  "entities": {
+    "Order": {
+      "title": "Order",
+      "description": "Customer e-commerce grocery order",
+      "type": "object",
+      "properties": {
+        "orderNumber": {
+          "type": "string",
+          "description": "Human-friendly order identifier e.g. MAK-1024",
+          "maxLength": 64
+        },
+        "orderType": {
+          "type": "string",
+          "enum": ["ecommerce", "curbside", "neighborhood_delivery"],
+          "description": "Order channel type"
+        },
+        "customerId": {
+          "type": "string",
+          "description": "Customer document ID e.g. cust_001",
+          "maxLength": 128
+        },
+        "customerCode": {
+          "type": "string",
+          "description": "Sequential customer code e.g. 001, 002",
+          "maxLength": 32
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Customer display name",
+          "maxLength": 120
+        },
+        "customerPhone": {
+          "type": "string",
+          "description": "Customer mobile number",
+          "maxLength": 30
+        },
+        "paymentMethod": {
+          "type": "string",
+          "enum": ["cash", "card", "online"],
+          "description": "Selected payment method"
+        },
+        "paymentStatus": {
+          "type": "string",
+          "enum": ["pending", "received"],
+          "description": "Payment status"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "processing", "ready", "completed", "cancelled"],
+          "description": "Order lifecycle status"
+        },
+        "itemsSerialized": {
+          "type": "string",
+          "description": "Serialized order items payload",
+          "maxLength": 20000
+        },
+        "customNotes": {
+          "type": "string",
+          "description": "Optional customer order notes",
+          "maxLength": 1000
+        },
+        "subtotal": {
+          "type": "number"
+        },
+        "tax": {
+          "type": "number"
+        },
+        "totalAmount": {
+          "type": "number"
+        },
+        "salesplaySyncStatus": {
+          "type": "string",
+          "enum": ["pending", "synced", "failed", "skipped"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "orderNumber",
+        "orderType",
+        "customerName",
+        "customerPhone",
+        "paymentMethod",
+        "paymentStatus",
+        "status",
+        "totalAmount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CustomerProfile": {
+      "title": "CustomerProfile",
+      "description": "Customer profile with sequential customerCode starting at 001",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "customerCode": { "type": "string", "maxLength": 32 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "phoneNormalized": { "type": "string", "maxLength": 30 },
+        "name": { "type": "string", "maxLength": 120 },
+        "salesplayCustomerId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "customerCode", "phone", "createdAt", "updatedAt"]
+    },
+    "Counter": {
+      "title": "Counter",
+      "description": "Sequential numeric ID counter for customer codes",
+      "type": "object",
+      "properties": {
+        "lastSeq": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["lastSeq", "updatedAt"]
+    },
+    "ProductTranslation": {
+      "title": "ProductTranslation",
+      "description": "Arabic translation record for a store product",
+      "type": "object",
+      "properties": {
+        "productId": { "type": "string", "maxLength": 128 },
+        "arabicName": { "type": "string", "maxLength": 200 },
+        "arabicCategory": { "type": "string", "maxLength": 100 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["productId", "arabicName", "arabicCategory", "updatedAt"]
+    },
+    "ProductMedia": {
+      "title": "ProductMedia",
+      "description": "Custom uploaded product image override",
+      "type": "object",
+      "properties": {
+        "productId": { "type": "string", "maxLength": 128 },
+        "imageUrl": { "type": "string", "maxLength": 1000000 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["productId", "imageUrl", "updatedAt"]
+    },
+    "StoreSettings": {
+      "title": "StoreSettings",
+      "description": "Store configuration settings",
+      "type": "object",
+      "properties": {
+        "houseDeliveryEnabled": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "CreditSettlement": {
+      "title": "CreditSettlement",
+      "description": "Settlement record for a customer's credit bill (full or partial)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "customerCode": { "type": "string", "maxLength": 32 },
+        "receiptNumber": { "type": "string", "maxLength": 64 },
+        "receiptDateTime": { "type": "string", "maxLength": 64 },
+        "billTotal": { "type": "number" },
+        "originalCreditAmount": { "type": "number" },
+        "settledAmount": { "type": "number" },
+        "settlementMethod": { "type": "string", "enum": ["cash", "card", "online"] },
+        "note": { "type": "string", "maxLength": 300 },
+        "settledByEmail": { "type": "string", "maxLength": 120 },
+        "settledAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "customerCode",
+        "receiptNumber",
+        "receiptDateTime",
+        "billTotal",
+        "originalCreditAmount",
+        "settledAmount",
+        "settlementMethod",
+        "settledAt",
+        "createdAt"
+      ]
+    },
+    "CustomerLedger": {
+      "title": "CustomerLedger",
+      "description": "Compact 1-doc-per-customer archive of finalized Paid and Settled bills to prevent 10,000-doc Firestore reads",
+      "type": "object",
+      "properties": {
+        "customerCode": { "type": "string", "maxLength": 32 },
+        "lastFinalizedAt": { "type": "string", "maxLength": 64 },
+        "totalArchivedBills": { "type": "number" },
+        "totalArchivedPaidAmount": { "type": "number" },
+        "archivedBills": {
+          "type": "array",
+          "description": "Compact native map summaries of finalized Cash/Card/Settled bills (max 350)"
+        },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "customerCode",
+        "lastFinalizedAt",
+        "totalArchivedBills",
+        "totalArchivedPaidAmount",
+        "archivedBills",
+        "updatedAt",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Customer orders"
+    },
+    "/customers/{customerId}": {
+      "schema": "CustomerProfile",
+      "description": "Customer profiles with sequential customerCode (001+)"
+    },
+    "/counters/{counterId}": {
+      "schema": "Counter",
+      "description": "Sequential customer code counters"
+    },
+    "/product_translations/{productId}": {
+      "schema": "ProductTranslation",
+      "description": "Arabic translations for SalesPlay products"
+    },
+    "/product_media/{productId}": {
+      "schema": "ProductMedia",
+      "description": "Product image overrides"
+    },
+    "/store_settings/{settingId}": {
+      "schema": "StoreSettings",
+      "description": "Store settings"
+    },
+    "/credit_settlements/{settlementId}": {
+      "schema": "CreditSettlement",
+      "description": "Credit bill settlement ledger entries per customer and receipt"
+    },
+    "/customer_ledgers/{customerCode}": {
+      "schema": "CustomerLedger",
+      "description": "Single-document compact archive of finalized Paid and Settled customer bills"
+    }
+  }
+}

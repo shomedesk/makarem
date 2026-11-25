@@ -1,0 +1,6 @@
+{
+  "name": "Makarem Al-Khair Modern Grocery",
+  "description": "Online grocery shopping, customer credit profile, and order management for Makarem Al-Khair Modern Grocery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
