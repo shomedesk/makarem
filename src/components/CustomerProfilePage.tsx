@@ -43,6 +43,7 @@ import {
   loadLocalBillArchive,
   mergeArchivedAndDeltaReceipts,
   saveLocalBillArchive,
+  subscribeToCustomerLedgerDoc,
 } from '../services/billArchiveService';
 import { CreditPieChart } from './CreditPieChart';
 import { QrBarcodeScannerModal } from './QrBarcodeScannerModal';
@@ -140,9 +141,10 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
       }
 
       const spData = await fetchSalesPlayCustomerProfile(activeCust.phone, activeCust.customerCode, {
-        since: preMerge.lastFinalizedAt || undefined,
+        since: forcePosRefresh ? undefined : preMerge.lastFinalizedAt || undefined,
         openBills: preMerge.openBillNumbers,
         force: forcePosRefresh,
+        full: forcePosRefresh,
       });
 
       if (spData) {
@@ -169,6 +171,8 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
           ledgerDoc: canonicalLedger,
           localArchive: canonicalLocal,
           deltaReceipts: spData.receipts || [],
+          activeReceiptNumbers: spData.activeReceiptNumbers,
+          windowStartDate: spData.windowStartDate,
         });
 
         setMergedReceipts(postMerge.mergedReceipts);
@@ -193,6 +197,8 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
                 ledgerDoc,
                 localArchive,
                 deltaReceipts: retryData.receipts || [],
+                activeReceiptNumbers: retryData.activeReceiptNumbers,
+                windowStartDate: retryData.windowStartDate,
               });
               setMergedReceipts(retryMerge.mergedReceipts);
               saveLocalBillArchive(
@@ -255,6 +261,47 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
     });
     return () => unsub();
   }, [effectiveCustomerCode, hasOpenCreditOrSettlements]);
+
+  // Live 1-doc listener on Firestore customer_ledgers/{code} so launched/static dashboards
+  // update immediately whenever Admin syncs new or deleted POS bills!
+  useEffect(() => {
+    if (!effectiveCustomerCode) return;
+    const unsub = subscribeToCustomerLedgerDoc(effectiveCustomerCode, (nextLedger) => {
+      if (!nextLedger) return;
+      setLedgerMeta(nextLedger);
+      setIsPosSyncPending(false);
+      // When running in Firestore snapshot mode (POS backend not active on host),
+      // treat updated customer_ledgers as authoritative so deleted bills also disappear from local cache
+      if (!posProfile?.matched) {
+        const snapshotMerge = mergeArchivedAndDeltaReceipts({
+          ledgerDoc: nextLedger,
+          localArchive: null,
+          deltaReceipts: [],
+        });
+        setMergedReceipts(snapshotMerge.mergedReceipts);
+        saveLocalBillArchive(
+          effectiveCustomerCode,
+          snapshotMerge.mergedReceipts,
+          snapshotMerge.lastFinalizedAt
+        );
+      }
+    });
+    return () => unsub();
+  }, [effectiveCustomerCode, posProfile?.matched]);
+
+  // Silently refresh when customer returns to the tab after >45s
+  useEffect(() => {
+    if (!profile) return;
+    let lastCheckedAt = Date.now();
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastCheckedAt < 45000) return;
+      lastCheckedAt = Date.now();
+      loadFullDashboard(profile, false);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [profile?.id, profile?.customerCode]);
 
   const effectiveCreditLimit =
     posProfile?.creditSummary?.creditLimit ??

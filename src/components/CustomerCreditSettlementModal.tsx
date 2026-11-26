@@ -69,6 +69,8 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
           ledgerDoc,
           localArchive: null,
           deltaReceipts: data.receipts || [],
+          activeReceiptNumbers: data.activeReceiptNumbers,
+          windowStartDate: data.windowStartDate,
         });
         setPosProfile({ ...data, receipts: merged.mergedReceipts });
       } else {
@@ -106,7 +108,7 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
 
   // Keep Firestore 1-doc ledger archive synchronized when Admin views or modifies settlements
   useEffect(() => {
-    if (!customer?.customerCode || !posProfile || enriched.bills.length === 0) return;
+    if (!customer?.customerCode || !posProfile || !posProfile.matched) return;
     const code = posProfile.customer?.customerCode || customer.customerCode;
     syncCustomerLedgerToFirestore(code, enriched.bills, {
       customerName: posProfile.customer?.name || customer.name,
@@ -115,6 +117,7 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
       totalVisits: posProfile.customer?.totalVisits ?? customer.totalVisits,
       totalSpent: posProfile.customer?.totalSpent ?? customer.totalSpent,
       firstVisit: posProfile.customer?.firstVisit || customer.firstVisit,
+      authoritativeWindowStart: posProfile.windowStartDate || undefined,
     }).catch((err) =>
       console.warn('Ledger archive sync skipped:', err)
     );

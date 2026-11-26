@@ -198,6 +198,8 @@ export interface SalesPlayCustomerProfileResponse {
   latestReceiptAt?: string;
   totalIndexedBills?: number;
   skippedArchivedCount?: number;
+  activeReceiptNumbers?: string[];
+  windowStartDate?: string;
   customer: {
     id: string;
     customerCode: string;

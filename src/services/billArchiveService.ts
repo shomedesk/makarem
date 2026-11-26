@@ -1,4 +1,4 @@
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, onSnapshot, setDoc, type Unsubscribe } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import type {
   ArchivedBillEntry,
@@ -35,6 +35,7 @@ export interface CustomerLedgerMeta {
   totalVisits?: number;
   totalSpent?: number;
   firstVisit?: string;
+  authoritativeWindowStart?: string;
 }
 
 export function loadLocalBillArchive(customerCode: string): LocalBillArchive | null {
@@ -113,6 +114,30 @@ export async function fetchCustomerLedgerDoc(
   }
 }
 
+/**
+ * Live 1-doc listener on a customer's Firestore ledger snapshot so any Admin sync
+ * (new bills, edited amounts, or deleted POS bills) updates open dashboards in real time.
+ */
+export function subscribeToCustomerLedgerDoc(
+  customerCode: string,
+  callback: (ledgerDoc: CustomerLedgerDoc | null) => void
+): Unsubscribe {
+  const docId = toLedgerDocId(customerCode);
+  if (!docId || docId === 'unknown') {
+    return () => {};
+  }
+
+  return onSnapshot(
+    doc(db, 'customer_ledgers', docId),
+    (snap) => {
+      callback(snap.exists() ? (snap.data() as CustomerLedgerDoc) : null);
+    },
+    (err) => {
+      console.warn('Customer ledger listener notice:', err);
+    }
+  );
+}
+
 function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerReceipt {
   const isRefund =
     entry.billStatus === 'refund' || String(entry.receiptType).toUpperCase() === 'REFUND';
@@ -175,6 +200,8 @@ export function mergeArchivedAndDeltaReceipts(params: {
   ledgerDoc: CustomerLedgerDoc | null;
   localArchive: LocalBillArchive | null;
   deltaReceipts: SalesPlayCustomerReceipt[];
+  activeReceiptNumbers?: string[];
+  windowStartDate?: string;
 }): {
   mergedReceipts: SalesPlayCustomerReceipt[];
   openBillNumbers: string[];
@@ -204,6 +231,18 @@ export function mergeArchivedAndDeltaReceipts(params: {
   for (const rec of params.deltaReceipts) {
     if (rec.receiptNumber) {
       byReceiptNo.set(rec.receiptNumber, rec);
+    }
+  }
+
+  // 4. Prune any bills inside the authoritative POS window that were deleted from SalesPlay POS
+  if (Array.isArray(params.activeReceiptNumbers)) {
+    const activeSet = new Set(params.activeReceiptNumbers.map((n) => String(n).trim()).filter(Boolean));
+    const cutoff = String(params.windowStartDate || '').trim();
+    for (const [recNo, rec] of byReceiptNo.entries()) {
+      const inPosWindow = !cutoff || !rec.dateTime || rec.dateTime >= cutoff;
+      if (inPosWindow && !activeSet.has(recNo)) {
+        byReceiptNo.delete(recNo);
+      }
     }
   }
 
@@ -255,14 +294,19 @@ export async function syncCustomerLedgerToFirestore(
   const billMap = new Map<string, ArchivedBillEntry>();
 
   let existingDoc: CustomerLedgerDoc | null = null;
+  const authoritativeCutoff = String(meta?.authoritativeWindowStart || '').trim();
   try {
     const snap = await getDoc(doc(db, 'customer_ledgers', docId));
     if (snap.exists()) {
       existingDoc = snap.data() as CustomerLedgerDoc;
       for (const oldEntry of existingDoc.archivedBills || []) {
-        if (oldEntry?.receiptNumber) {
-          billMap.set(oldEntry.receiptNumber, oldEntry);
+        if (!oldEntry?.receiptNumber) continue;
+        // If this sync has an authoritative POS window start, prune bills inside that window
+        // so deleted SalesPlay POS receipts are cleanly removed from Firestore too!
+        if (authoritativeCutoff && (!oldEntry.dateTime || oldEntry.dateTime >= authoritativeCutoff)) {
+          continue;
         }
+        billMap.set(oldEntry.receiptNumber, oldEntry);
       }
     }
   } catch {
@@ -321,10 +365,9 @@ export async function syncCustomerLedgerToFirestore(
     .map((b) => b.dateTime)
     .sort((a, b) => (a < b ? 1 : -1))[0] || '';
 
-  const totalArchivedBills = Math.max(
-    allBills.length,
-    Number(existingDoc?.totalArchivedBills || 0)
-  );
+  const totalArchivedBills = authoritativeCutoff
+    ? allBills.length
+    : Math.max(allBills.length, Number(existingDoc?.totalArchivedBills || 0));
   const totalArchivedPaidAmount = round3(
     finalizedOnly
       .filter((b) => b.billStatus !== 'refund')
@@ -353,13 +396,22 @@ export async function syncCustomerLedgerToFirestore(
       ? String(meta.customerPhone || '').slice(0, 30)
       : existingDoc?.customerPhone;
 
+  const digestEntries = (list: ArchivedBillEntry[] = []) =>
+    list
+      .map(
+        (b) =>
+          `${b.receiptNumber}:${b.billStatus}:${Number(b.creditAmount || 0).toFixed(3)}:${Number(
+            b.totalMoney || 0
+          ).toFixed(3)}`
+      )
+      .join('|');
+
   // Skip write if archive & metadata state is already identical
   if (
     existingDoc &&
     existingDoc.lastFinalizedAt === lastFinalizedAt &&
     existingDoc.totalArchivedBills === totalArchivedBills &&
-    existingDoc.archivedBills?.length === cappedBills.length &&
-    existingDoc.archivedBills?.[0]?.billStatus === cappedBills[0]?.billStatus &&
+    digestEntries(existingDoc.archivedBills) === digestEntries(cappedBills) &&
     (existingDoc.creditLimit ?? null) === (nextCreditLimit ?? null) &&
     (existingDoc.totalVisits ?? null) === (nextTotalVisits ?? null) &&
     (existingDoc.customerName || '') === (nextCustomerName || '') &&

@@ -150,6 +150,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Refresh & Translate Catalog state
   const [isRefreshingSync, setIsRefreshingSync] = useState(false);
   const [syncBannerMsg, setSyncBannerMsg] = useState<string | null>(null);
+  const [autoPosCloudSync, setAutoPosCloudSync] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('makarem_auto_pos_cloud_sync_v1') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [isAutoSyncTicking, setIsAutoSyncTicking] = useState(false);
 
   // 58mm Thermal Printer state
   const [printerName, setPrinterName] = useState<string | null>(() => getConnectedPrinterName());
@@ -272,6 +280,57 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   useEffect(() => {
     loadAdminAnalytics(false);
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('makarem_auto_pos_cloud_sync_v1', autoPosCloudSync ? '1' : '0');
+    } catch {
+      // ignore storage errors
+    }
+    if (!autoPosCloudSync) return;
+
+    let cancelled = false;
+    const runDeltaBridge = async () => {
+      if (cancelled) return;
+      setIsAutoSyncTicking(true);
+      try {
+        const res = await syncAllSalesPlayCustomersToFirestore({
+          syncLedgers: true,
+          forcePosRebuild: false,
+          onlyChanged: true,
+        });
+        if (cancelled) return;
+        if (!res.posConnected) {
+          setAutoPosCloudSync(false);
+          setSyncBannerMsg(
+            isAr
+              ? 'المزامنة التلقائية متاحة فقط من رابط التطوير (Dev) أو الخادم المتصل بالكاشير.'
+              : 'Auto-Sync requires the POS backend (open Dev Admin on your counter PC/tablet).'
+          );
+          return;
+        }
+        if (res.ledgersWritten > 0 || res.customersSynced > 0) {
+          setSyncBannerMsg(
+            isAr
+              ? `مزامنة تلقائية: تم تحديث ${res.ledgersWritten} سجل عميل جديد/محذوف على الأجهزة المنشورة.`
+              : `Auto-Sync updated ${res.ledgersWritten} changed customer ledger(s) & ${res.customersSynced} profile(s) to cloud.`
+          );
+          loadCustomersDirectory();
+        }
+      } catch {
+        // non-fatal
+      } finally {
+        if (!cancelled) setIsAutoSyncTicking(false);
+      }
+    };
+
+    runDeltaBridge();
+    const timerId = window.setInterval(runDeltaBridge, 60000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [autoPosCloudSync]);
 
   useEffect(() => {
     if (activeTab === 'customers' && customers.length === 0) {
@@ -1178,8 +1237,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </button>
         </div>
 
-        {/* Sync to Customer Devices & Audio Controls */}
-        <div className="flex items-center gap-2 self-end sm:self-auto">
+        {/* Sync to Customer Devices & Auto-Sync Bridge & Audio Controls */}
+        <div className="flex flex-wrap items-center gap-2 self-end sm:self-auto">
+          <button
+            type="button"
+            onClick={() => setAutoPosCloudSync((prev) => !prev)}
+            title={
+              isAr
+                ? 'تشغيل المزامنة التلقائية كل 60 ثانية للفواتير الجديدة والمحذوفة'
+                : 'Auto-push new or deleted POS bills to launched customer dashboards every 60s'
+            }
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold rounded-lg border transition cursor-pointer whitespace-nowrap ${
+              autoPosCloudSync
+                ? 'bg-emerald-50 border-emerald-400 text-emerald-900'
+                : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                autoPosCloudSync
+                  ? isAutoSyncTicking
+                    ? 'bg-amber-500 animate-ping'
+                    : 'bg-emerald-600'
+                  : 'bg-slate-400'
+              }`}
+            />
+            <span>
+              {isAr
+                ? `مزامنة تلقائية 60ث: ${autoPosCloudSync ? 'تعمل' : 'متوقفة'}`
+                : `Auto-Sync 60s: ${autoPosCloudSync ? 'ON' : 'OFF'}`}
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={handleRefreshAndTranslate}

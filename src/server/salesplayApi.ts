@@ -288,12 +288,13 @@ async function getCustomersCached(forceRefresh = false): Promise<any[]> {
   return items;
 }
 
-const RECEIPT_INCREMENTAL_COOLDOWN_MS = 30 * 1000;
+const RECEIPT_INCREMENTAL_COOLDOWN_MS = 15 * 1000;
 const receiptIndex = {
   byNumber: new Map<string, IndexedReceiptRecord>(),
   bootstrappedAtMs: 0,
   lastIncrementalSyncMs: 0,
   latestDateTimeSql: '',
+  windowStartDateSql: '',
   inFlight: null as Promise<void> | null,
 };
 
@@ -348,7 +349,8 @@ function normalizeRawReceipt(r: any): IndexedReceiptRecord {
   };
 }
 
-function ingestRawReceipts(rawList: any[]) {
+function ingestRawReceipts(rawList: any[]): Set<string> {
+  const activeNumbers = new Set<string>();
   for (const r of rawList) {
     const recNo = String(r.receipt_number || '').trim();
     if (!recNo) continue;
@@ -358,22 +360,25 @@ function ingestRawReceipts(rawList: any[]) {
     }
     const normalized = normalizeRawReceipt(r);
     receiptIndex.byNumber.set(recNo, normalized);
+    activeNumbers.add(recNo);
     if (normalized.dateTime && normalized.dateTime > receiptIndex.latestDateTimeSql) {
       receiptIndex.latestDateTimeSql = normalized.dateTime;
     }
   }
+  return activeNumbers;
 }
 
 async function ensureReceiptsSynced(
   forceRefresh = false,
-  openBillsToCheck: string[] = []
+  openBillsToCheck: string[] = [],
+  forceFullRebuild = false
 ): Promise<void> {
   if (receiptIndex.inFlight) {
     return receiptIndex.inFlight;
   }
 
   const nowMs = Date.now();
-  const needsBootstrap = receiptIndex.bootstrappedAtMs === 0;
+  const needsBootstrap = receiptIndex.bootstrappedAtMs === 0 || forceFullRebuild;
   const needsIncremental =
     forceRefresh || nowMs - receiptIndex.lastIncrementalSyncMs >= RECEIPT_INCREMENTAL_COOLDOWN_MS;
 
@@ -385,8 +390,8 @@ async function ensureReceiptsSynced(
     const now = new Date();
     const maxWindow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-    if (receiptIndex.bootstrappedAtMs === 0) {
-      // Cold start: backfill 90 days in three parallel 30-day windows ONCE
+    if (receiptIndex.bootstrappedAtMs === 0 || forceFullRebuild) {
+      // Full 90-day authoritative rebuild in three parallel 30-day windows (removes any deleted POS bills!)
       const d30 = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
       const d60 = new Date(now.getTime() - 58 * 24 * 60 * 60 * 1000);
       const d90 = new Date(now.getTime() - 87 * 24 * 60 * 60 * 1000);
@@ -397,37 +402,56 @@ async function ensureReceiptsSynced(
         fetchAllPaginated<any>('/receipts', 'receipts', {
           created_at_min: formatDateSql(d30),
           created_at_max: formatDateSql(maxWindow),
-        }).catch(() => [] as any[]),
+        }).catch(() => null),
         fetchAllPaginated<any>('/receipts', 'receipts', {
           created_at_min: formatDateSql(d60),
           created_at_max: formatDateSql(d30Minus1s),
-        }).catch(() => [] as any[]),
+        }).catch(() => null),
         fetchAllPaginated<any>('/receipts', 'receipts', {
           created_at_min: formatDateSql(d90),
           created_at_max: formatDateSql(d60Minus1s),
-        }).catch(() => [] as any[]),
+        }).catch(() => null),
       ]);
 
-      ingestRawReceipts([...rWin1, ...rWin2, ...rWin3]);
+      // Only clear existing index if all 3 windows succeeded cleanly so transient network blips don't wipe data
+      if (rWin1 && rWin2 && rWin3) {
+        receiptIndex.byNumber.clear();
+        receiptIndex.latestDateTimeSql = '';
+        receiptIndex.windowStartDateSql = formatDateSql(d90);
+        ingestRawReceipts([...rWin1, ...rWin2, ...rWin3]);
+      } else {
+        receiptIndex.windowStartDateSql = receiptIndex.windowStartDateSql || formatDateSql(d90);
+        ingestRawReceipts([...(rWin1 || []), ...(rWin2 || []), ...(rWin3 || [])]);
+      }
+
       receiptIndex.bootstrappedAtMs = Date.now();
       receiptIndex.lastIncrementalSyncMs = Date.now();
       return;
     }
 
-    // Incremental sync: only fetch the recent 48h window (typically 1 API call instead of full history)
+    // Incremental sync: fetch recent 48h window AND reconcile any bills deleted from POS inside that window
     const dRecent = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+    const recentCutoffSql = formatDateSql(dRecent);
     const recentReceipts = await fetchAllPaginated<any>('/receipts', 'receipts', {
-      created_at_min: formatDateSql(dRecent),
+      created_at_min: recentCutoffSql,
       created_at_max: formatDateSql(maxWindow),
-    }).catch(() => [] as any[]);
-    ingestRawReceipts(recentReceipts);
+    }).catch(() => null);
+
+    if (Array.isArray(recentReceipts)) {
+      const seenInRecent = ingestRawReceipts(recentReceipts);
+      for (const [recNo, existing] of receiptIndex.byNumber.entries()) {
+        if (existing.dateTime && existing.dateTime >= recentCutoffSql && !seenInRecent.has(recNo)) {
+          receiptIndex.byNumber.delete(recNo);
+        }
+      }
+    }
 
     // If caller passes older open DUE bills (>48h old), refresh their narrow day windows
-    // so POS settlements of older credit bills are detected without fetching all history.
+    // so POS settlements or deletions of older credit bills are detected immediately.
     if (openBillsToCheck.length > 0) {
       const checkedDays = new Set<string>();
       const recentCutoffMs = dRecent.getTime();
-      const narrowFetches: Promise<any[]>[] = [];
+      const narrowFetches: Array<{ dayKey: string; promise: Promise<any[] | null> }> = [];
 
       for (const billNo of openBillsToCheck.slice(0, 12)) {
         const existing = receiptIndex.byNumber.get(billNo);
@@ -440,18 +464,27 @@ async function ensureReceiptsSynced(
 
         const dayStart = new Date(dtMs - 12 * 60 * 60 * 1000);
         const dayEnd = new Date(dtMs + 12 * 60 * 60 * 1000);
-        narrowFetches.push(
-          fetchAllPaginated<any>('/receipts', 'receipts', {
+        narrowFetches.push({
+          dayKey,
+          promise: fetchAllPaginated<any>('/receipts', 'receipts', {
             created_at_min: formatDateSql(dayStart),
             created_at_max: formatDateSql(dayEnd),
-          }).catch(() => [] as any[])
-        );
+          }).catch(() => null),
+        });
       }
 
       if (narrowFetches.length > 0) {
-        const narrowResults = await Promise.all(narrowFetches);
-        for (const list of narrowResults) {
-          ingestRawReceipts(list);
+        const narrowResults = await Promise.all(
+          narrowFetches.map(async (nf) => ({ dayKey: nf.dayKey, list: await nf.promise }))
+        );
+        for (const { dayKey, list } of narrowResults) {
+          if (!Array.isArray(list)) continue;
+          const seenInDay = ingestRawReceipts(list);
+          for (const [recNo, existing] of receiptIndex.byNumber.entries()) {
+            if (existing.dateTime && existing.dateTime.startsWith(dayKey) && !seenInDay.has(recNo)) {
+              receiptIndex.byNumber.delete(recNo);
+            }
+          }
         }
       }
     }
@@ -701,7 +734,7 @@ export async function handleSalesPlayRequest(
 
       const [customers] = await Promise.all([
         getCustomersCached(forceRefresh),
-        ensureReceiptsSynced(forceRefresh, openBillsList),
+        ensureReceiptsSynced(forceRefresh, openBillsList, forceRefresh && forceFull),
       ]);
 
       // Match by phone_number or customer_code (exact or numeric-stripped)
@@ -790,6 +823,8 @@ export async function handleSalesPlayRequest(
         latestReceiptAt: fullCustomerReceipts[0]?.dateTime || '',
         totalIndexedBills: fullCustomerReceipts.length,
         skippedArchivedCount: Math.max(0, fullCustomerReceipts.length - receiptsToReturn.length),
+        activeReceiptNumbers: fullCustomerReceipts.map((r) => r.receiptNumber),
+        windowStartDate: receiptIndex.windowStartDateSql,
         customer: {
           id: matchedCustomer.id,
           customerCode: matchedCustomer.customer_code || '',
@@ -857,7 +892,7 @@ export async function handleSalesPlayRequest(
       const forceRefresh = parsedUrl.searchParams.get('force') === '1';
       const [customers] = await Promise.all([
         getCustomersCached(forceRefresh),
-        ensureReceiptsSynced(forceRefresh),
+        ensureReceiptsSynced(forceRefresh, [], forceRefresh),
       ]);
 
       const snapshots = customers.map((c: any) => {
@@ -898,6 +933,7 @@ export async function handleSalesPlayRequest(
 
       sendJson(res, 200, {
         success: true,
+        windowStartDate: receiptIndex.windowStartDateSql,
         count: snapshots.length,
         snapshots,
       });

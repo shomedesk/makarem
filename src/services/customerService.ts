@@ -738,27 +738,42 @@ export interface CustomerFirestoreSyncResult {
   requiresAuth?: boolean;
 }
 
+const lastSyncedProfileDigests = new Map<string, string>();
+const lastSyncedLedgerDigests = new Map<string, string>();
+const knownCustomerDocMeta = new Map<
+  string,
+  { firestoreId: string; createdAt: string; phone?: string; phoneNormalized?: string }
+>();
+
 /**
  * Admin-only: Imports & refreshes all SalesPlay POS customers AND their bill/credit ledgers into Firestore
  * so Customer Dashboards work seamlessly even when offline or launched on static hosts.
  */
 export async function syncAllSalesPlayCustomersToFirestore(options?: {
   syncLedgers?: boolean;
+  forcePosRebuild?: boolean;
+  onlyChanged?: boolean;
 }): Promise<CustomerFirestoreSyncResult> {
   const shouldSyncLedgers = options?.syncLedgers !== false;
+  const forcePosRebuild = options?.forcePosRebuild !== false;
+  const onlyChanged = Boolean(options?.onlyChanged);
+
   let snapshots: any[] = [];
+  let windowStartDate = '';
   let posConnected = false;
 
   if (shouldSyncLedgers) {
     try {
-      const res = await fetch('/api/salesplay/export-customer-snapshots', {
-        cache: 'no-store',
-      });
+      const url = forcePosRebuild
+        ? '/api/salesplay/export-customer-snapshots?force=1'
+        : '/api/salesplay/export-customer-snapshots';
+      const res = await fetch(url, { cache: 'no-store' });
       const ct = res.headers.get('content-type') || '';
       if (res.ok && ct.includes('application/json')) {
         const data = await res.json();
         if (data?.success && Array.isArray(data?.snapshots)) {
           snapshots = data.snapshots;
+          windowStartDate = String(data?.windowStartDate || '').trim();
           posConnected = true;
         }
       }
@@ -767,10 +782,26 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
     }
   }
 
-  const all = await fetchAllCustomersForAdmin();
-  const posCustomers = all.filter((c) => Boolean(c.salesplayId && c.customerCode));
-  if (posCustomers.length > 0) {
-    posConnected = true;
+  // Only fetch Firestore customers collection when doing full manual sync or initial cache warm
+  const existingByCode = new Map<string, AdminCustomerRecord>();
+  let posCustomers: AdminCustomerRecord[] = [];
+  if (!onlyChanged || snapshots.length === 0 || lastSyncedProfileDigests.size === 0) {
+    const all = await fetchAllCustomersForAdmin();
+    posCustomers = all.filter((c) => Boolean(c.salesplayId && c.customerCode));
+    if (posCustomers.length > 0) {
+      posConnected = true;
+    }
+    for (const c of all) {
+      if (c.customerCode) {
+        existingByCode.set(c.customerCode, c);
+        knownCustomerDocMeta.set(c.customerCode, {
+          firestoreId: c.firestoreId || `cust_${c.customerCode.replace(/[^a-zA-Z0-9_\-]/g, '_')}`,
+          createdAt: c.createdAt || '',
+          phone: c.phone || '',
+          phoneNormalized: c.phoneNormalized || '',
+        });
+      }
+    }
   }
 
   if (posCustomers.length === 0 && snapshots.length === 0) {
@@ -780,13 +811,6 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
       ledgersTotal: 0,
       posConnected,
     };
-  }
-
-  const existingByCode = new Map<string, AdminCustomerRecord>();
-  for (const c of all) {
-    if (c.customerCode) {
-      existingByCode.set(c.customerCode, c);
-    }
   }
 
   const now = new Date().toISOString();
@@ -806,7 +830,7 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
           receipts: [],
         }));
 
-  // Write customers collection in safe chunks of 400 docs
+  // Write customers collection in safe chunks of 400 docs (skip unchanged during onlyChanged auto-sync)
   let customersSynced = 0;
   for (let i = 0; i < sourceList.length; i += 400) {
     const chunk = sourceList.slice(i, i + 400);
@@ -817,10 +841,35 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
       const code = String(c.customerCode || '').trim();
       if (!code) continue;
       const existing = existingByCode.get(code);
+      const cachedMeta = knownCustomerDocMeta.get(code);
       const docId =
-        existing?.firestoreId || `cust_${code.replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
-      const phone = String(c.phone || existing?.phone || '').trim();
-      const phoneNormalized = normalizePhoneNumber(phone) || existing?.phoneNormalized || '';
+        existing?.firestoreId ||
+        cachedMeta?.firestoreId ||
+        `cust_${code.replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
+      const phone = String(c.phone || existing?.phone || cachedMeta?.phone || '').trim();
+      const phoneNormalized =
+        normalizePhoneNumber(phone) || existing?.phoneNormalized || cachedMeta?.phoneNormalized || '';
+      const profileDigest = `${code}|${phone}|${c.name || ''}|${c.creditLimit ?? ''}|${
+        c.totalVisits ?? ''
+      }|${c.totalSpent ?? ''}|${c.firstVisit || ''}`;
+
+      if (onlyChanged && lastSyncedProfileDigests.get(code) === profileDigest) {
+        continue;
+      }
+
+      // Always preserve existing createdAt so firestore.rules immutability check passes across auto-sync runs
+      let preservedCreatedAt = existing?.createdAt || cachedMeta?.createdAt || '';
+      if (!preservedCreatedAt) {
+        try {
+          const snap = await getDoc(doc(db, 'customers', docId));
+          if (snap.exists() && snap.data()?.createdAt) {
+            preservedCreatedAt = String(snap.data()?.createdAt);
+          }
+        } catch {
+          // treat as new doc
+        }
+      }
+      const createdAtToWrite = preservedCreatedAt || now;
 
       batch.set(
         doc(db, 'customers', docId),
@@ -837,11 +886,18 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
           ...(c.totalVisits !== undefined ? { totalVisits: Number(c.totalVisits || 0) } : {}),
           ...(c.totalSpent !== undefined ? { totalSpent: Number(c.totalSpent || 0) } : {}),
           ...(c.firstVisit ? { firstVisit: String(c.firstVisit).slice(0, 64) } : {}),
-          createdAt: existing?.createdAt || now,
+          createdAt: createdAtToWrite,
           updatedAt: now,
         },
         { merge: true }
       );
+      knownCustomerDocMeta.set(code, {
+        firestoreId: docId,
+        createdAt: createdAtToWrite,
+        phone,
+        phoneNormalized,
+      });
+      lastSyncedProfileDigests.set(code, profileDigest);
       chunkWrites++;
     }
 
@@ -878,10 +934,33 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
       }
 
       const validSnapshots = snapshots.filter((s) => Boolean(String(s.customerCode || '').trim()));
-      for (let i = 0; i < validSnapshots.length; i += 8) {
-        const chunk = validSnapshots.slice(i, i + 8);
+      const snapshotsToProcess = validSnapshots.filter((s) => {
+        const code = String(s.customerCode || '').trim();
+        const custSettlements = settlementsByCode.get(code) || [];
+        const receiptSig = (s.receipts || [])
+          .map(
+            (r: any) =>
+              `${r.receiptNumber}:${r.receiptType}:${Number(r.creditAmount || 0).toFixed(3)}:${Number(
+                r.totalMoney || 0
+              ).toFixed(3)}`
+          )
+          .join(',');
+        const settleSig = custSettlements.map((st: any) => `${st.id}:${st.settledAmount}`).join(',');
+        const ledgerDigest = `${s.name || ''}|${s.phone || ''}|${s.creditLimit ?? ''}|${
+          s.totalVisits ?? 0
+        }|${receiptSig}|${settleSig}`;
+        if (onlyChanged && lastSyncedLedgerDigests.get(code) === ledgerDigest) {
+          ledgersTotal++;
+          return false;
+        }
+        (s as any).__ledgerDigest = ledgerDigest;
+        return true;
+      });
+
+      for (let i = 0; i < snapshotsToProcess.length; i += 8) {
+        const chunk = snapshotsToProcess.slice(i, i + 8);
         const outcomes = await Promise.all(
-          chunk.map((s) => {
+          chunk.map(async (s) => {
             const code = String(s.customerCode || '').trim();
             const custSettlements = settlementsByCode.get(code) || [];
             const enriched = computeEnrichedCustomerBills(
@@ -889,17 +968,22 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
               custSettlements,
               s.creditLimit ?? null
             );
-            return syncCustomerLedgerToFirestore(code, enriched.bills, {
+            const outcome = await syncCustomerLedgerToFirestore(code, enriched.bills, {
               customerName: s.name || undefined,
               customerPhone: s.phone || undefined,
               creditLimit: s.creditLimit ?? null,
               totalVisits: Number(s.totalVisits || 0),
               totalSpent: Number(s.totalSpent || 0),
               firstVisit: s.firstVisit || undefined,
+              authoritativeWindowStart: windowStartDate || undefined,
             }).catch((err) => {
               console.warn(`Ledger sync skipped for #${code}:`, err);
               return 'invalid' as const;
             });
+            if (outcome === 'written' || outcome === 'unchanged') {
+              lastSyncedLedgerDigests.set(code, (s as any).__ledgerDigest || '');
+            }
+            return outcome;
           })
         );
 
