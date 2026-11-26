@@ -137,6 +137,7 @@ export default function App() {
     const savedEmail = localStorage.getItem('makarem_admin_email');
     return isEmailAuthorizedAdmin(savedEmail);
   });
+  const [isAdminAuthConfirmed, setIsAdminAuthConfirmed] = useState<boolean>(false);
 
   // Store public config (WhatsApp, Intro Video popup, Today's Offers)
   const initialPublicCfg = React.useMemo(() => loadCachedPublicConfig(), []);
@@ -245,8 +246,9 @@ export default function App() {
 
   // Listen to Firebase Admin Auth state
   useEffect(() => {
-    const unsub = subscribeToAdminState((isAdmin) => {
+    const unsub = subscribeToAdminState((isAdmin, user) => {
       setIsAdminLoggedIn(isAdmin);
+      setIsAdminAuthConfirmed(Boolean(isAdmin && user));
       if (!isAdmin && currentRoute === 'admin') {
         setCurrentRoute('shop');
       }
@@ -447,17 +449,33 @@ export default function App() {
       }
     }
 
-    // Push single compact snapshot + bump push version in store_settings/catalog_meta
+    // Push single compact snapshot + bump push version in store_settings/catalog_meta + sync customer ledgers
     let pushedToDevices = false;
+    let customersSynced = 0;
+    let ledgersSynced = 0;
+    let posConnected: boolean | undefined = undefined;
+
     if (itemsToCheck.length > 0) {
       const newPushVersion = String(Date.now());
       try {
-        await Promise.all([
+        const [, custSync] = await Promise.all([
           pushCatalogToCustomerDevices(itemsToCheck, newPushVersion),
-          syncAllSalesPlayCustomersToFirestore().catch(() => null),
+          syncAllSalesPlayCustomersToFirestore({ syncLedgers: true }).catch(() => null),
         ]);
         localStorage.setItem(PUSH_VERSION_KEY, newPushVersion);
         pushedToDevices = true;
+        if (custSync) {
+          customersSynced = custSync.customersSynced;
+          ledgersSynced = custSync.ledgersTotal;
+          posConnected = custSync.posConnected;
+          if (custSync.posConnected && custSync.ledgersTotal > 0) {
+            try {
+              localStorage.setItem('makarem_cust_ledger_sync_v3', '1');
+            } catch {
+              // ignore
+            }
+          }
+        }
       } catch (err) {
         console.warn('Could not push catalog snapshot to customer devices:', err);
       }
@@ -468,6 +486,9 @@ export default function App() {
       translatedNew,
       translationError,
       pushedToDevices,
+      customersSynced,
+      ledgersSynced,
+      posConnected,
     };
   }, [fetchSalesPlayProducts, rawSalesPlayItems]);
 
@@ -563,15 +584,10 @@ export default function App() {
     bootstrapCatalogSmartly();
   }, [fetchSalesPlayProducts]);
 
-  // Real-time orders listener (Admin only) + Sound Chime + 58mm Auto-Print + auto-bootstrap Firestore snapshot if empty
+  // Ensure Firestore catalog_snapshot & POS customer ledgers exist ONLY after Firebase Admin Auth token is ready
   useEffect(() => {
-    if (!isAdminLoggedIn) {
-      setOrders([]);
-      knownOrderIdsRef.current = null;
-      return;
-    }
+    if (!isAdminAuthConfirmed) return;
 
-    // Ensure Firestore catalog_snapshot & POS customer ledgers exist for offline/static launches
     fetchCatalogPushMeta()
       .then(async (meta) => {
         if (!meta) {
@@ -587,12 +603,14 @@ export default function App() {
             }
           }
         }
-        const ledgerBootstrapDone = localStorage.getItem('makarem_cust_ledger_sync_v2') === '1';
+        const ledgerBootstrapDone = localStorage.getItem('makarem_cust_ledger_sync_v3') === '1';
         if (!meta || !ledgerBootstrapDone) {
-          const syncedCount = await syncAllSalesPlayCustomersToFirestore({ syncLedgers: true }).catch(() => 0);
-          if (syncedCount > 0) {
+          const custRes = await syncAllSalesPlayCustomersToFirestore({ syncLedgers: true }).catch(
+            () => null
+          );
+          if (custRes && custRes.posConnected && custRes.ledgersTotal > 0) {
             try {
-              localStorage.setItem('makarem_cust_ledger_sync_v2', '1');
+              localStorage.setItem('makarem_cust_ledger_sync_v3', '1');
             } catch {
               // ignore
             }
@@ -600,6 +618,16 @@ export default function App() {
         }
       })
       .catch(() => null);
+  }, [isAdminAuthConfirmed]);
+
+  // Real-time orders listener (Admin only) + Sound Chime + 58mm Auto-Print
+  useEffect(() => {
+    if (!isAdminLoggedIn) {
+      setOrders([]);
+      knownOrderIdsRef.current = null;
+      return;
+    }
+
     const unsubscribe = subscribeToOrders((newOrders) => {
       setOrders(newOrders);
 
@@ -853,6 +881,7 @@ export default function App() {
               setActiveOrder(ord);
               navigateTo('shop');
             }}
+            onProfileRefreshed={(updated) => setCustomerProfile(updated)}
             isAutoLoggingIn={isUrlAutoLoggingIn}
             autoLoginError={urlAutoLoginError}
             language={language}

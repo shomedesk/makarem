@@ -10,9 +10,10 @@ import {
   runTransaction,
   writeBatch,
 } from 'firebase/firestore';
-import { db } from '../firebase';
+import { auth, db } from '../firebase';
 import type {
   AdminCustomerRecord,
+  CustomerLedgerDoc,
   CustomerProfile,
   Order,
   SalesPlayCustomerProfileResponse,
@@ -175,9 +176,23 @@ export async function loginOrRegisterCustomer(
 
   if (looksLikeCode) {
     const paddedCode = /^\d{1,3}$/.test(raw) ? formatCustomerCode(Number(raw)) : raw;
+    const candidates = Array.from(new Set([paddedCode, raw]));
 
-    // 1. Check Firestore by customerCode
-    for (const candidateCode of Array.from(new Set([paddedCode, raw]))) {
+    // 1. Check Firestore customers by direct doc ID & customerCode query
+    for (const candidateCode of candidates) {
+      try {
+        const directSnap = await getDoc(
+          doc(db, 'customers', `cust_${candidateCode.replace(/[^a-zA-Z0-9_\-]/g, '_')}`)
+        );
+        if (directSnap.exists()) {
+          const profile = { id: directSnap.id, ...directSnap.data() } as CustomerProfile;
+          saveLocalCustomerProfile(profile);
+          return profile;
+        }
+      } catch {
+        // continue to query
+      }
+
       const qCode = query(
         collection(db, 'customers'),
         where('customerCode', '==', candidateCode)
@@ -191,7 +206,37 @@ export async function loginOrRegisterCustomer(
       }
     }
 
-    // 2. Fallback: Check SalesPlay POS by customerCode -> create/link Firestore profile cleanly
+    // 2. Fallback: Check customer_ledgers/{code} snapshot in Firestore (works on launched static hosts!)
+    for (const candidateCode of candidates) {
+      try {
+        const ledgerSnap = await getDoc(
+          doc(db, 'customer_ledgers', candidateCode.replace(/[^a-zA-Z0-9_\-]/g, '_'))
+        );
+        if (ledgerSnap.exists()) {
+          const ld = ledgerSnap.data() as CustomerLedgerDoc;
+          const nowIso = new Date().toISOString();
+          const hydrated: CustomerProfile = {
+            id: `cust_${candidateCode.replace(/[^a-zA-Z0-9_\-]/g, '_')}`,
+            customerCode: ld.customerCode || candidateCode,
+            phone: ld.customerPhone || '',
+            phoneNormalized: normalizePhoneNumber(ld.customerPhone || ''),
+            ...(ld.customerName ? { name: ld.customerName } : {}),
+            ...(ld.creditLimit !== undefined ? { creditLimit: ld.creditLimit } : {}),
+            ...(ld.totalVisits !== undefined ? { totalVisits: ld.totalVisits } : {}),
+            ...(ld.totalSpent !== undefined ? { totalSpent: ld.totalSpent } : {}),
+            ...(ld.firstVisit ? { firstVisit: ld.firstVisit } : {}),
+            createdAt: ld.createdAt || nowIso,
+            updatedAt: nowIso,
+          };
+          saveLocalCustomerProfile(hydrated);
+          return hydrated;
+        }
+      } catch {
+        // continue to POS check
+      }
+    }
+
+    // 3. Fallback: Check SalesPlay POS by customerCode -> create/link Firestore profile cleanly
     const spMatch = await fetchSalesPlayCustomerProfile(undefined, paddedCode);
     if (spMatch?.matched && spMatch.customer) {
       const linked = await upsertSalesPlayMatchedCustomer(
@@ -211,7 +256,7 @@ export async function loginOrRegisterCustomer(
     throw new Error('Please enter a valid mobile number (at least 7 digits)');
   }
 
-  // 1. Search Firestore customers by phoneNormalized
+  // 1. Search Firestore customers by phoneNormalized (and raw phone fallback)
   const qPhone = query(
     collection(db, 'customers'),
     where('phoneNormalized', '==', normDigits)
@@ -219,6 +264,18 @@ export async function loginOrRegisterCustomer(
   const phoneSnap = await getDocs(qPhone);
   if (!phoneSnap.empty) {
     const docSnap = phoneSnap.docs[0];
+    const profile = { id: docSnap.id, ...docSnap.data() } as CustomerProfile;
+    saveLocalCustomerProfile(profile);
+    return profile;
+  }
+
+  const qRawPhone = query(
+    collection(db, 'customers'),
+    where('phone', '==', raw)
+  );
+  const rawPhoneSnap = await getDocs(qRawPhone);
+  if (!rawPhoneSnap.empty) {
+    const docSnap = rawPhoneSnap.docs[0];
     const profile = { id: docSnap.id, ...docSnap.data() } as CustomerProfile;
     saveLocalCustomerProfile(profile);
     return profile;
@@ -235,6 +292,10 @@ export async function loginOrRegisterCustomer(
       phone: data.phone || raw,
       phoneNormalized: normDigits,
       name: data.name,
+      ...(data.creditLimit !== undefined ? { creditLimit: data.creditLimit } : {}),
+      ...(data.totalVisits !== undefined ? { totalVisits: data.totalVisits } : {}),
+      ...(data.totalSpent !== undefined ? { totalSpent: data.totalSpent } : {}),
+      ...(data.firstVisit ? { firstVisit: data.firstVisit } : {}),
       createdAt: data.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -384,6 +445,59 @@ async function allocateNextCustomerCode(
   return createdProfile;
 }
 
+export async function refreshCustomerProfileFromFirestore(
+  current: CustomerProfile
+): Promise<CustomerProfile | null> {
+  try {
+    let matchedDoc: CustomerProfile | null = null;
+
+    if (current.id) {
+      const direct = await getDoc(doc(db, 'customers', current.id));
+      if (direct.exists()) {
+        matchedDoc = { id: direct.id, ...direct.data() } as CustomerProfile;
+      }
+    }
+
+    if (!matchedDoc && current.customerCode) {
+      const safeId = `cust_${current.customerCode.trim().replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
+      const byCustId = await getDoc(doc(db, 'customers', safeId));
+      if (byCustId.exists()) {
+        matchedDoc = { id: byCustId.id, ...byCustId.data() } as CustomerProfile;
+      } else {
+        const snap = await getDocs(
+          query(collection(db, 'customers'), where('customerCode', '==', current.customerCode.trim()))
+        );
+        if (!snap.empty) {
+          const d = snap.docs[0];
+          matchedDoc = { id: d.id, ...d.data() } as CustomerProfile;
+        }
+      }
+    }
+
+    if (!matchedDoc && current.phone) {
+      const norm = normalizePhoneNumber(current.phone);
+      if (norm) {
+        const snap = await getDocs(
+          query(collection(db, 'customers'), where('phoneNormalized', '==', norm))
+        );
+        if (!snap.empty) {
+          const d = snap.docs[0];
+          matchedDoc = { id: d.id, ...d.data() } as CustomerProfile;
+        }
+      }
+    }
+
+    if (matchedDoc) {
+      const merged: CustomerProfile = { ...current, ...matchedDoc };
+      saveLocalCustomerProfile(merged);
+      return merged;
+    }
+  } catch (err) {
+    console.warn('Could not refresh customer profile from Firestore:', err);
+  }
+  return null;
+}
+
 export async function fetchCustomerOrders(
   phone?: string,
   customerCode?: string
@@ -409,19 +523,25 @@ export async function fetchCustomerOrders(
 
     if (phone && phone.trim()) {
       const cleanPhone = phone.trim();
-      const qPhone = query(
-        collection(db, 'orders'),
-        where('customerPhone', '==', cleanPhone)
+      const norm = normalizePhoneNumber(cleanPhone);
+      const phoneCandidates = Array.from(
+        new Set([cleanPhone, norm, norm ? `968${norm}` : '', norm ? `+968${norm}` : ''].filter(Boolean))
       );
-      const snap = await getDocs(qPhone);
-      snap.forEach((d) => {
-        const data = d.data();
-        ordersMap.set(d.id, {
-          id: d.id,
-          ...data,
-          items: data.items || (data.itemsSerialized ? JSON.parse(data.itemsSerialized) : []),
-        } as Order);
-      });
+      for (const pCandidate of phoneCandidates) {
+        const qPhone = query(
+          collection(db, 'orders'),
+          where('customerPhone', '==', pCandidate)
+        );
+        const snap = await getDocs(qPhone);
+        snap.forEach((d) => {
+          const data = d.data();
+          ordersMap.set(d.id, {
+            id: d.id,
+            ...data,
+            items: data.items || (data.itemsSerialized ? JSON.parse(data.itemsSerialized) : []),
+          } as Order);
+        });
+      }
     }
   } catch (err) {
     console.warn('Error fetching customer orders:', err);
@@ -488,6 +608,18 @@ export async function fetchAllCustomersForAdmin(): Promise<AdminCustomerRecord[]
       if (phone) existingMatch.phone = phone;
       if (phoneNorm) existingMatch.phoneNormalized = phoneNorm;
       if (data.name) existingMatch.name = data.name;
+      if (existingMatch.creditLimit === null && data.creditLimit !== undefined) {
+        existingMatch.creditLimit = data.creditLimit;
+      }
+      if (!existingMatch.totalSpent && data.totalSpent !== undefined) {
+        existingMatch.totalSpent = Number(data.totalSpent || 0);
+      }
+      if (!existingMatch.totalVisits && data.totalVisits !== undefined) {
+        existingMatch.totalVisits = Number(data.totalVisits || 0);
+      }
+      if (!existingMatch.firstVisit && data.firstVisit) {
+        existingMatch.firstVisit = data.firstVisit;
+      }
       existingMatch.createdAt = data.createdAt;
       existingMatch.updatedAt = data.updatedAt;
     } else {
@@ -499,9 +631,10 @@ export async function fetchAllCustomersForAdmin(): Promise<AdminCustomerRecord[]
         phone,
         phoneNormalized: phoneNorm,
         name: data.name || (code ? `Customer #${code}` : 'Online Customer'),
-        creditLimit: null,
-        totalSpent: 0,
-        totalVisits: 0,
+        creditLimit: data.creditLimit !== undefined ? data.creditLimit : null,
+        totalSpent: Number(data.totalSpent || 0),
+        totalVisits: Number(data.totalVisits || 0),
+        firstVisit: data.firstVisit || '',
         source: 'firestore',
         createdAt: data.createdAt,
         updatedAt: data.updatedAt,
@@ -597,25 +730,36 @@ export async function adminDeleteCustomerDoc(firestoreId: string): Promise<void>
   await deleteDoc(doc(db, 'customers', firestoreId));
 }
 
+export interface CustomerFirestoreSyncResult {
+  customersSynced: number;
+  ledgersWritten: number;
+  ledgersTotal: number;
+  posConnected: boolean;
+  requiresAuth?: boolean;
+}
+
 /**
  * Admin-only: Imports & refreshes all SalesPlay POS customers AND their bill/credit ledgers into Firestore
  * so Customer Dashboards work seamlessly even when offline or launched on static hosts.
  */
 export async function syncAllSalesPlayCustomersToFirestore(options?: {
   syncLedgers?: boolean;
-}): Promise<number> {
+}): Promise<CustomerFirestoreSyncResult> {
   const shouldSyncLedgers = options?.syncLedgers !== false;
   let snapshots: any[] = [];
+  let posConnected = false;
 
   if (shouldSyncLedgers) {
     try {
       const res = await fetch('/api/salesplay/export-customer-snapshots', {
         cache: 'no-store',
       });
-      if (res.ok) {
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.includes('application/json')) {
         const data = await res.json();
-        if (Array.isArray(data?.snapshots)) {
+        if (data?.success && Array.isArray(data?.snapshots)) {
           snapshots = data.snapshots;
+          posConnected = true;
         }
       }
     } catch {
@@ -625,7 +769,18 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
 
   const all = await fetchAllCustomersForAdmin();
   const posCustomers = all.filter((c) => Boolean(c.salesplayId && c.customerCode));
-  if (posCustomers.length === 0 && snapshots.length === 0) return 0;
+  if (posCustomers.length > 0) {
+    posConnected = true;
+  }
+
+  if (posCustomers.length === 0 && snapshots.length === 0) {
+    return {
+      customersSynced: 0,
+      ledgersWritten: 0,
+      ledgersTotal: 0,
+      posConnected,
+    };
+  }
 
   const existingByCode = new Map<string, AdminCustomerRecord>();
   for (const c of all) {
@@ -635,9 +790,6 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
   }
 
   const now = new Date().toISOString();
-  const batch = writeBatch(db);
-  let count = 0;
-
   const sourceList =
     snapshots.length > 0
       ? snapshots
@@ -654,79 +806,120 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
           receipts: [],
         }));
 
-  for (const c of sourceList) {
-    const code = String(c.customerCode || '').trim();
-    if (!code) continue;
-    const existing = existingByCode.get(code);
-    const docId =
-      existing?.firestoreId || `cust_${code.replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
-    const phone = String(c.phone || existing?.phone || '').trim();
-    const phoneNormalized = normalizePhoneNumber(phone) || existing?.phoneNormalized || '';
+  // Write customers collection in safe chunks of 400 docs
+  let customersSynced = 0;
+  for (let i = 0; i < sourceList.length; i += 400) {
+    const chunk = sourceList.slice(i, i + 400);
+    const batch = writeBatch(db);
+    let chunkWrites = 0;
 
-    batch.set(
-      doc(db, 'customers', docId),
-      {
-        id: docId,
-        customerCode: code,
-        phone,
-        phoneNormalized,
-        ...(c.name ? { name: String(c.name).slice(0, 120) } : {}),
-        ...(c.id ? { salesplayCustomerId: String(c.id).slice(0, 128) } : {}),
-        ...(c.creditLimit !== null && c.creditLimit !== undefined
-          ? { creditLimit: Number(c.creditLimit) }
-          : {}),
-        ...(c.totalVisits !== undefined ? { totalVisits: Number(c.totalVisits || 0) } : {}),
-        ...(c.totalSpent !== undefined ? { totalSpent: Number(c.totalSpent || 0) } : {}),
-        ...(c.firstVisit ? { firstVisit: String(c.firstVisit).slice(0, 64) } : {}),
-        createdAt: existing?.createdAt || now,
-        updatedAt: now,
-      },
-      { merge: true }
-    );
-    count++;
+    for (const c of chunk) {
+      const code = String(c.customerCode || '').trim();
+      if (!code) continue;
+      const existing = existingByCode.get(code);
+      const docId =
+        existing?.firestoreId || `cust_${code.replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
+      const phone = String(c.phone || existing?.phone || '').trim();
+      const phoneNormalized = normalizePhoneNumber(phone) || existing?.phoneNormalized || '';
+
+      batch.set(
+        doc(db, 'customers', docId),
+        {
+          id: docId,
+          customerCode: code,
+          phone,
+          phoneNormalized,
+          ...(c.name ? { name: String(c.name).slice(0, 120) } : {}),
+          ...(c.id ? { salesplayCustomerId: String(c.id).slice(0, 128) } : {}),
+          ...(c.creditLimit !== null && c.creditLimit !== undefined
+            ? { creditLimit: Number(c.creditLimit) }
+            : {}),
+          ...(c.totalVisits !== undefined ? { totalVisits: Number(c.totalVisits || 0) } : {}),
+          ...(c.totalSpent !== undefined ? { totalSpent: Number(c.totalSpent || 0) } : {}),
+          ...(c.firstVisit ? { firstVisit: String(c.firstVisit).slice(0, 64) } : {}),
+          createdAt: existing?.createdAt || now,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+      chunkWrites++;
+    }
+
+    if (chunkWrites > 0) {
+      await batch.commit();
+      customersSynced += chunkWrites;
+    }
   }
 
-  if (count > 0) {
-    await batch.commit();
-  }
+  let ledgersWritten = 0;
+  let ledgersTotal = 0;
+  let requiresAuth = false;
 
   // Sync each customer's bills & credit metadata into customer_ledgers/{customerCode}
   if (shouldSyncLedgers && snapshots.length > 0) {
-    const [{ fetchAllSettlementsForAdmin, computeEnrichedCustomerBills }, { syncCustomerLedgerToFirestore }] =
-      await Promise.all([
-        import('./creditSettlementService'),
-        import('./billArchiveService'),
-      ]);
+    await auth.authStateReady();
+    if (!auth.currentUser?.email) {
+      requiresAuth = true;
+    } else {
+      const [{ fetchAllSettlementsForAdmin, computeEnrichedCustomerBills }, { syncCustomerLedgerToFirestore }] =
+        await Promise.all([
+          import('./creditSettlementService'),
+          import('./billArchiveService'),
+        ]);
 
-    const allSettlements = await fetchAllSettlementsForAdmin().catch(() => []);
-    const settlementsByCode = new Map<string, any[]>();
-    for (const st of allSettlements) {
-      const k = String(st.customerCode || '').trim();
-      if (!k) continue;
-      const arr = settlementsByCode.get(k) || [];
-      arr.push(st);
-      settlementsByCode.set(k, arr);
-    }
+      const allSettlements = await fetchAllSettlementsForAdmin().catch(() => []);
+      const settlementsByCode = new Map<string, any[]>();
+      for (const st of allSettlements) {
+        const k = String(st.customerCode || '').trim();
+        if (!k) continue;
+        const arr = settlementsByCode.get(k) || [];
+        arr.push(st);
+        settlementsByCode.set(k, arr);
+      }
 
-    for (const s of snapshots) {
-      const code = String(s.customerCode || '').trim();
-      if (!code) continue;
-      const custSettlements = settlementsByCode.get(code) || [];
-      const enriched = computeEnrichedCustomerBills(
-        s.receipts || [],
-        custSettlements,
-        s.creditLimit ?? null
-      );
-      await syncCustomerLedgerToFirestore(code, enriched.bills, {
-        customerName: s.name || undefined,
-        customerPhone: s.phone || undefined,
-        creditLimit: s.creditLimit ?? null,
-        totalVisits: Number(s.totalVisits || 0),
-        totalSpent: Number(s.totalSpent || 0),
-        firstVisit: s.firstVisit || undefined,
-      }).catch((err) => console.warn(`Ledger sync skipped for #${code}:`, err));
+      const validSnapshots = snapshots.filter((s) => Boolean(String(s.customerCode || '').trim()));
+      for (let i = 0; i < validSnapshots.length; i += 8) {
+        const chunk = validSnapshots.slice(i, i + 8);
+        const outcomes = await Promise.all(
+          chunk.map((s) => {
+            const code = String(s.customerCode || '').trim();
+            const custSettlements = settlementsByCode.get(code) || [];
+            const enriched = computeEnrichedCustomerBills(
+              s.receipts || [],
+              custSettlements,
+              s.creditLimit ?? null
+            );
+            return syncCustomerLedgerToFirestore(code, enriched.bills, {
+              customerName: s.name || undefined,
+              customerPhone: s.phone || undefined,
+              creditLimit: s.creditLimit ?? null,
+              totalVisits: Number(s.totalVisits || 0),
+              totalSpent: Number(s.totalSpent || 0),
+              firstVisit: s.firstVisit || undefined,
+            }).catch((err) => {
+              console.warn(`Ledger sync skipped for #${code}:`, err);
+              return 'invalid' as const;
+            });
+          })
+        );
+
+        for (const out of outcomes) {
+          if (out === 'written') {
+            ledgersWritten++;
+            ledgersTotal++;
+          } else if (out === 'unchanged') {
+            ledgersTotal++;
+          }
+        }
+      }
     }
   }
 
-  return count;
+  return {
+    customersSynced,
+    ledgersWritten,
+    ledgersTotal,
+    posConnected,
+    requiresAuth,
+  };
 }

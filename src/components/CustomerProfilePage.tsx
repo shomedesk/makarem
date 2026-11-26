@@ -30,6 +30,8 @@ import type {
 import {
   fetchCustomerOrders,
   fetchSalesPlayCustomerProfile,
+  formatCustomerCode,
+  refreshCustomerProfileFromFirestore,
 } from '../services/customerService';
 import {
   computeEnrichedCustomerBills,
@@ -53,6 +55,7 @@ interface CustomerProfilePageProps {
   onLogout: () => void;
   onBackToShop: () => void;
   onTrackOrder: (order: Order) => void;
+  onProfileRefreshed?: (updated: CustomerProfile) => void;
   isAutoLoggingIn?: boolean;
   autoLoginError?: string | null;
   language: 'en' | 'ar';
@@ -64,6 +67,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
   onLogout,
   onBackToShop,
   onTrackOrder,
+  onProfileRefreshed,
   isAutoLoggingIn = false,
   autoLoginError = null,
   language,
@@ -84,21 +88,42 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
   const [mergedReceipts, setMergedReceipts] = useState<SalesPlayCustomerReceipt[]>([]);
   const [settlements, setSettlements] = useState<CreditSettlementRecord[]>([]);
   const [expandedBills, setExpandedBills] = useState<Record<string, boolean>>({});
+  const [isPosSyncPending, setIsPosSyncPending] = useState(false);
 
   const loadFullDashboard = async (cust: CustomerProfile, forcePosRefresh = false) => {
     setIsLoading(true);
+    setIsPosSyncPending(false);
     try {
-      const localArchive = loadLocalBillArchive(cust.customerCode);
+      const paddedCode =
+        /^\d{1,3}$/.test(String(cust.customerCode || '').trim())
+          ? formatCustomerCode(Number(cust.customerCode))
+          : cust.customerCode;
+
+      const localArchive =
+        loadLocalBillArchive(cust.customerCode) ||
+        (paddedCode !== cust.customerCode ? loadLocalBillArchive(paddedCode) : null);
 
       if (localArchive?.receipts?.length) {
         setMergedReceipts(localArchive.receipts);
       }
 
-      const [ordersList, ledgerDoc, initialSettlements] = await Promise.all([
-        fetchCustomerOrders(cust.phone, cust.customerCode),
-        fetchCustomerLedgerDoc(cust.customerCode),
-        fetchCustomerSettlements(cust.customerCode),
-      ]);
+      const [refreshedFsProfile, ordersList, primaryLedger, initialSettlements] =
+        await Promise.all([
+          refreshCustomerProfileFromFirestore(cust),
+          fetchCustomerOrders(cust.phone, cust.customerCode),
+          fetchCustomerLedgerDoc(cust.customerCode),
+          fetchCustomerSettlements(cust.customerCode),
+        ]);
+
+      let ledgerDoc = primaryLedger;
+      if (!ledgerDoc && paddedCode && paddedCode !== cust.customerCode) {
+        ledgerDoc = await fetchCustomerLedgerDoc(paddedCode);
+      }
+
+      const activeCust = refreshedFsProfile || cust;
+      if (refreshedFsProfile && onProfileRefreshed) {
+        onProfileRefreshed(refreshedFsProfile);
+      }
 
       setAppOrders(ordersList);
       setLedgerMeta(ledgerDoc);
@@ -114,7 +139,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
         setMergedReceipts(preMerge.mergedReceipts);
       }
 
-      const spData = await fetchSalesPlayCustomerProfile(cust.phone, cust.customerCode, {
+      const spData = await fetchSalesPlayCustomerProfile(activeCust.phone, activeCust.customerCode, {
         since: preMerge.lastFinalizedAt || undefined,
         openBills: preMerge.openBillNumbers,
         force: forcePosRefresh,
@@ -122,11 +147,12 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
 
       if (spData) {
         setPosProfile(spData);
-        const canonicalCode = spData.customer?.customerCode || cust.customerCode;
+        setIsPosSyncPending(false);
+        const canonicalCode = spData.customer?.customerCode || activeCust.customerCode;
 
         let canonicalLedger = ledgerDoc;
         let canonicalLocal = localArchive;
-        if (canonicalCode && canonicalCode !== cust.customerCode) {
+        if (canonicalCode && canonicalCode !== activeCust.customerCode) {
           const [extraLedger, extraSettlements] = await Promise.all([
             fetchCustomerLedgerDoc(canonicalCode),
             fetchCustomerSettlements(canonicalCode),
@@ -151,27 +177,36 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
           postMerge.mergedReceipts,
           postMerge.lastFinalizedAt
         );
-      } else if (!forcePosRefresh && preMerge.mergedReceipts.length === 0) {
-        // Retry once after 2s in case server was warming POS receipt index
-        setTimeout(async () => {
-          const retryData = await fetchSalesPlayCustomerProfile(cust.phone, cust.customerCode, {
-            full: true,
-          });
-          if (retryData?.matched) {
-            setPosProfile(retryData);
-            const retryMerge = mergeArchivedAndDeltaReceipts({
-              ledgerDoc,
-              localArchive,
-              deltaReceipts: retryData.receipts || [],
-            });
-            setMergedReceipts(retryMerge.mergedReceipts);
-            saveLocalBillArchive(
-              retryData.customer?.customerCode || cust.customerCode,
-              retryMerge.mergedReceipts,
-              retryMerge.lastFinalizedAt
+      } else if (!ledgerDoc && preMerge.mergedReceipts.length === 0) {
+        if (!forcePosRefresh) {
+          // Retry once after 2s in case POS server was warming receipt index
+          setTimeout(async () => {
+            const retryData = await fetchSalesPlayCustomerProfile(
+              activeCust.phone,
+              activeCust.customerCode,
+              { full: true }
             );
-          }
-        }, 2000);
+            if (retryData?.matched) {
+              setPosProfile(retryData);
+              setIsPosSyncPending(false);
+              const retryMerge = mergeArchivedAndDeltaReceipts({
+                ledgerDoc,
+                localArchive,
+                deltaReceipts: retryData.receipts || [],
+              });
+              setMergedReceipts(retryMerge.mergedReceipts);
+              saveLocalBillArchive(
+                retryData.customer?.customerCode || activeCust.customerCode,
+                retryMerge.mergedReceipts,
+                retryMerge.lastFinalizedAt
+              );
+            } else {
+              setIsPosSyncPending(true);
+            }
+          }, 2000);
+        } else {
+          setIsPosSyncPending(true);
+        }
       }
     } catch (err) {
       console.warn('Error loading customer profile dashboard:', err);
@@ -621,15 +656,23 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
                     ? isAr
                       ? 'ممتاز! لا توجد فواتير مستحقة غير مسددة'
                       : 'All clear! No unpaid due bills'
+                    : isPosSyncPending
+                    ? isAr
+                      ? 'لم تتم مزامنة فواتير نقاط البيع لهذا الحساب بعد'
+                      : 'POS store bills not synced yet for this card'
                     : isAr
                     ? 'لا توجد فواتير متجر حديثة'
                     : 'No store bills found'}
                 </p>
-                <p className="text-xs">
+                <p className="text-xs max-w-md mx-auto">
                   {billFilter === 'due'
                     ? isAr
                       ? 'تمت تسوية جميع فواتير الائتمان الخاصة بك.'
                       : 'All your credit bills have been settled.'
+                    : isPosSyncPending
+                    ? isAr
+                      ? 'يرجى الطلب من إدارة البقالة الضغط على "مزامنة وإرسال لأجهزة العملاء" من لوحة التحكم لتظهر الفواتير والرصيد هنا.'
+                      : 'Store Admin needs to click "Sync to Customer Devices" once so your store bills and credit balance appear on launched devices.'
                     : isAr
                     ? 'ستظهر جميع فواتير الكاشير برقم الفاتورة والتاريخ والحالة هنا تلقائياً'
                     : 'All store bills with bill number, date, status, and amount appear here automatically.'}

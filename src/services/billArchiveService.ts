@@ -234,6 +234,8 @@ export function mergeArchivedAndDeltaReceipts(params: {
   };
 }
 
+export type LedgerSyncOutcome = 'written' | 'unchanged' | 'unauthorized' | 'invalid';
+
 /**
  * Admin-only: Syncs BOTH open due/partial bills AND finalized Paid/Settled bills plus credit metadata
  * into the single-doc `/customer_ledgers/{customerCode}` snapshot so customer dashboards work
@@ -243,10 +245,11 @@ export async function syncCustomerLedgerToFirestore(
   customerCode: string,
   enrichedBills: EnrichedCustomerReceipt[],
   meta?: CustomerLedgerMeta
-): Promise<boolean> {
-  if (!auth.currentUser?.email) return false;
+): Promise<LedgerSyncOutcome> {
+  await auth.authStateReady();
+  if (!auth.currentUser?.email) return 'unauthorized';
   const docId = toLedgerDocId(customerCode);
-  if (!docId || docId === 'unknown') return false;
+  if (!docId || docId === 'unknown') return 'invalid';
 
   const now = new Date().toISOString();
   const billMap = new Map<string, ArchivedBillEntry>();
@@ -359,16 +362,19 @@ export async function syncCustomerLedgerToFirestore(
     existingDoc.archivedBills?.[0]?.billStatus === cappedBills[0]?.billStatus &&
     (existingDoc.creditLimit ?? null) === (nextCreditLimit ?? null) &&
     (existingDoc.totalVisits ?? null) === (nextTotalVisits ?? null) &&
+    (existingDoc.customerName || '') === (nextCustomerName || '') &&
+    (existingDoc.customerPhone || '') === (nextCustomerPhone || '') &&
     Math.abs(Number(existingDoc.totalArchivedPaidAmount || 0) - totalArchivedPaidAmount) < 0.001
   ) {
-    return false;
+    return 'unchanged';
   }
 
   const payload: CustomerLedgerDoc = {
     customerCode: String(customerCode).trim().slice(0, 32),
     ...(nextCustomerName ? { customerName: nextCustomerName } : {}),
     ...(nextCustomerPhone ? { customerPhone: nextCustomerPhone } : {}),
-    ...(nextHasCreditLimit ? { creditLimit: nextCreditLimit, hasCreditLimit: true } : { hasCreditLimit: false }),
+    creditLimit: nextHasCreditLimit ? nextCreditLimit : null,
+    hasCreditLimit: nextHasCreditLimit,
     ...(nextTotalVisits !== undefined ? { totalVisits: nextTotalVisits } : {}),
     ...(nextTotalSpent !== undefined ? { totalSpent: nextTotalSpent } : {}),
     ...(nextFirstVisit ? { firstVisit: nextFirstVisit } : {}),
@@ -382,7 +388,7 @@ export async function syncCustomerLedgerToFirestore(
 
   try {
     await setDoc(doc(db, 'customer_ledgers', docId), payload);
-    return true;
+    return 'written';
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `customer_ledgers/${docId}`);
   }

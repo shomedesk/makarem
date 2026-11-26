@@ -90,6 +90,9 @@ interface AdminDashboardProps {
     translatedNew: number;
     translationError?: string;
     pushedToDevices?: boolean;
+    customersSynced?: number;
+    ledgersSynced?: number;
+    posConnected?: boolean;
   }>;
   onUpdateProductImage?: (productId: string, imageUrl: string) => void;
   autoPrintEnabled: boolean;
@@ -487,11 +490,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setSyncBannerMsg(null);
     try {
       const res = await onRefreshAndTranslateCatalog();
+      const ledgerPart =
+        typeof res.ledgersSynced === 'number' && res.ledgersSynced > 0
+          ? isAr
+            ? ` + ${res.customersSynced || res.ledgersSynced} عميل و${res.ledgersSynced} سجل فواتير`
+            : ` + ${res.customersSynced || res.ledgersSynced} customers & ${res.ledgersSynced} bill ledgers`
+          : res.posConnected === false
+          ? isAr
+            ? ' (تنبيه: سجلات POS تحتاج المزامنة من بيئة التطوير)'
+            : ' (Note: POS customer ledgers require syncing from Dev Admin)'
+          : '';
+
       const pushNote = res.pushedToDevices
         ? isAr
-          ? ' وتم إرسال التحديث لجميع أجهزة العملاء!'
-          : ' & pushed to all customer devices!'
-        : '';
+          ? ` وتم إرسال التحديث${ledgerPart} لجميع أجهزة العملاء!`
+          : ` & pushed${ledgerPart} to all customer devices!`
+        : ledgerPart;
 
       if (res.translationError) {
         setSyncBannerMsg(
@@ -512,6 +526,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             : `Synced ${res.totalItems} live items${pushNote}`
         );
       }
+      await loadCustomersDirectory();
     } finally {
       setIsRefreshingSync(false);
     }
@@ -743,14 +758,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleSyncCustomersFromPos = async () => {
     setIsSyncingCustomers(true);
     try {
-      const imported = await syncAllSalesPlayCustomersToFirestore();
+      const res = await syncAllSalesPlayCustomersToFirestore({ syncLedgers: true });
       await loadCustomersDirectory();
-      setClearNotice(
-        isAr
-          ? `تمت مزامنة العملاء بدون تكرار (${imported} حساب جديد تم ربطه).`
-          : `Customers synced cleanly (${imported} new POS customer(s) linked to Firestore).`
-      );
-      setTimeout(() => setClearNotice(null), 4000);
+      if (!res.posConnected) {
+        setClearNotice(
+          isAr
+            ? 'تعذر الاتصال بخادم POS من هذا الرابط. يرجى الضغط على "مزامنة" من لوحة التحكم في رابط التطوير (Dev).'
+            : 'POS backend is not connected on this host. Run Sync from your Dev Admin panel to push customer bills to Firestore.'
+        );
+      } else if (res.requiresAuth) {
+        setClearNotice(
+          isAr
+            ? `تم حفظ ${res.customersSynced} عميل — يرجى تسجيل الدخول بحساب الإدارة لحفظ سجلات الفواتير.`
+            : `Saved ${res.customersSynced} customer profiles — please re-sign in as Admin to write bill ledgers.`
+        );
+      } else {
+        setClearNotice(
+          isAr
+            ? `تمت مزامنة ${res.customersSynced} عميل و ${res.ledgersTotal} سجل فواتير (${res.ledgersWritten} محدّث) إلى Firestore للعمل على الموقع المنشور.`
+            : `Synced ${res.customersSynced} customers & ${res.ledgersTotal} bill ledgers (${res.ledgersWritten} updated) to Firestore for launched devices.`
+        );
+      }
+      setTimeout(() => setClearNotice(null), 6000);
     } finally {
       setIsSyncingCustomers(false);
     }
