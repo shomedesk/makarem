@@ -108,10 +108,17 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
   useEffect(() => {
     if (!customer?.customerCode || !posProfile || enriched.bills.length === 0) return;
     const code = posProfile.customer?.customerCode || customer.customerCode;
-    syncCustomerLedgerToFirestore(code, enriched.bills).catch((err) =>
+    syncCustomerLedgerToFirestore(code, enriched.bills, {
+      customerName: posProfile.customer?.name || customer.name,
+      customerPhone: posProfile.customer?.phone || customer.phone,
+      creditLimit: posProfile.creditSummary?.creditLimit ?? customer.creditLimit ?? null,
+      totalVisits: posProfile.customer?.totalVisits ?? customer.totalVisits,
+      totalSpent: posProfile.customer?.totalSpent ?? customer.totalSpent,
+      firstVisit: posProfile.customer?.firstVisit || customer.firstVisit,
+    }).catch((err) =>
       console.warn('Ledger archive sync skipped:', err)
     );
-  }, [customer?.customerCode, posProfile, enriched.bills]);
+  }, [customer?.customerCode, customer?.name, customer?.phone, customer?.creditLimit, customer?.totalVisits, customer?.totalSpent, customer?.firstVisit, posProfile, enriched.bills]);
 
   if (!customer) return null;
 

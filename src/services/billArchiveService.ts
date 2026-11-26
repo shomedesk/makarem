@@ -28,6 +28,15 @@ export interface LocalBillArchive {
   updatedAt: string;
 }
 
+export interface CustomerLedgerMeta {
+  customerName?: string;
+  customerPhone?: string;
+  creditLimit?: number | null;
+  totalVisits?: number;
+  totalSpent?: number;
+  firstVisit?: string;
+}
+
 export function loadLocalBillArchive(customerCode: string): LocalBillArchive | null {
   const keyCode = toLedgerDocId(customerCode);
   if (!keyCode || keyCode === 'unknown') return null;
@@ -52,7 +61,6 @@ export function saveLocalBillArchive(
   if (!keyCode || keyCode === 'unknown') return;
 
   try {
-    // Keep line-item detail for the most recent 250 bills, and header-only compact rows up to 10,000
     const compactReceipts = receipts.slice(0, MAX_LOCAL_RECEIPTS).map((rec, idx) => {
       if (idx < MAX_LOCAL_WITH_ITEMS) return rec;
       return {
@@ -69,7 +77,6 @@ export function saveLocalBillArchive(
     };
     localStorage.setItem(`${LOCAL_ARCHIVE_PREFIX}${keyCode}`, JSON.stringify(payload));
   } catch (err) {
-    // Fallback if storage quota is tight: save only most recent 500 bills without items
     try {
       const tiny = receipts.slice(0, 500).map((rec) => ({ ...rec, items: [] }));
       localStorage.setItem(
@@ -107,9 +114,42 @@ export async function fetchCustomerLedgerDoc(
 }
 
 function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerReceipt {
-  const isRefund = entry.billStatus === 'refund' || String(entry.receiptType).toUpperCase() === 'REFUND';
+  const isRefund =
+    entry.billStatus === 'refund' || String(entry.receiptType).toUpperCase() === 'REFUND';
+  const creditAmt = round3(Math.max(0, Number(entry.creditAmount || 0)));
+  const paidAmt = round3(Math.max(0, Number(entry.paidAmount || 0)));
+  const isOpenDue =
+    !isRefund &&
+    (entry.billStatus === 'due' || entry.billStatus === 'partial' || creditAmt > 0);
   const isSettled = entry.billStatus === 'settled';
-  const payLabel = entry.paymentSummary || (isSettled ? 'Settled' : 'Paid');
+
+  const payments: SalesPlayCustomerReceipt['payments'] = [];
+  if (!isRefund) {
+    if (isOpenDue && creditAmt > 0) {
+      if (paidAmt > 0) {
+        payments.push({
+          type: 'Cash',
+          amount: paidAmt,
+          paidAt: entry.dateTime,
+          isAdvance: false,
+        });
+      }
+      payments.push({
+        type: 'Credit',
+        amount: creditAmt,
+        paidAt: entry.dateTime,
+        isAdvance: false,
+      });
+    } else {
+      const payLabel = entry.paymentSummary || (isSettled ? 'Settled' : 'Paid');
+      payments.push({
+        type: payLabel,
+        amount: paidAmt || Number(entry.totalMoney || 0),
+        paidAt: entry.dateTime,
+        isAdvance: isSettled,
+      });
+    }
+  }
 
   return {
     receiptNumber: entry.receiptNumber,
@@ -119,19 +159,10 @@ function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerRece
     totalDiscount: 0,
     cashierName: '',
     note: '',
-    creditAmount: 0,
-    paidAmount: isRefund ? 0 : Number(entry.paidAmount || entry.totalMoney || 0),
+    creditAmount: isRefund ? 0 : creditAmt,
+    paidAmount: isRefund ? 0 : paidAmt || (isOpenDue ? 0 : Number(entry.totalMoney || 0)),
     hasAdvance: isSettled,
-    payments: isRefund
-      ? []
-      : [
-          {
-            type: payLabel,
-            amount: Number(entry.paidAmount || entry.totalMoney || 0),
-            paidAt: entry.dateTime,
-            isAdvance: isSettled,
-          },
-        ],
+    payments,
     items: [],
   };
 }
@@ -151,7 +182,7 @@ export function mergeArchivedAndDeltaReceipts(params: {
 } {
   const byReceiptNo = new Map<string, SalesPlayCustomerReceipt>();
 
-  // 1. Seed from Firestore ledger archived entries (oldest baseline, works across new devices)
+  // 1. Seed from Firestore ledger snapshot (works on offline/launched devices & new browsers)
   if (params.ledgerDoc?.archivedBills?.length) {
     for (const entry of params.ledgerDoc.archivedBills) {
       if (entry.receiptNumber) {
@@ -182,10 +213,13 @@ export function mergeArchivedAndDeltaReceipts(params: {
 
   // Determine open bills (creditAmount > 0) and newest finalized timestamp
   const openBillNumbers: string[] = [];
-  let lastFinalizedAt = params.ledgerDoc?.lastFinalizedAt || params.localArchive?.lastFinalizedAt || '';
+  let lastFinalizedAt =
+    params.ledgerDoc?.lastFinalizedAt || params.localArchive?.lastFinalizedAt || '';
 
   for (const rec of mergedReceipts) {
-    const isOpenCredit = Number(rec.creditAmount || 0) > 0 && String(rec.receiptType).toUpperCase() !== 'REFUND';
+    const isOpenCredit =
+      Number(rec.creditAmount || 0) > 0 &&
+      String(rec.receiptType).toUpperCase() !== 'REFUND';
     if (isOpenCredit) {
       openBillNumbers.push(rec.receiptNumber);
     } else if (rec.dateTime && rec.dateTime > lastFinalizedAt) {
@@ -201,21 +235,22 @@ export function mergeArchivedAndDeltaReceipts(params: {
 }
 
 /**
- * Admin-only: Syncs finalized Paid/Settled bills into the single-doc `/customer_ledgers/{customerCode}`
- * archive so customers never cause 10,000-bill Firestore reads across devices.
+ * Admin-only: Syncs BOTH open due/partial bills AND finalized Paid/Settled bills plus credit metadata
+ * into the single-doc `/customer_ledgers/{customerCode}` snapshot so customer dashboards work
+ * reliably even on static/launched sites without backend POS access.
  */
 export async function syncCustomerLedgerToFirestore(
   customerCode: string,
-  enrichedBills: EnrichedCustomerReceipt[]
+  enrichedBills: EnrichedCustomerReceipt[],
+  meta?: CustomerLedgerMeta
 ): Promise<boolean> {
   if (!auth.currentUser?.email) return false;
   const docId = toLedgerDocId(customerCode);
   if (!docId || docId === 'unknown') return false;
 
   const now = new Date().toISOString();
-  const finalizedMap = new Map<string, ArchivedBillEntry>();
+  const billMap = new Map<string, ArchivedBillEntry>();
 
-  // Preserve any historical archived bills beyond POS's 90-day window
   let existingDoc: CustomerLedgerDoc | null = null;
   try {
     const snap = await getDoc(doc(db, 'customer_ledgers', docId));
@@ -223,7 +258,7 @@ export async function syncCustomerLedgerToFirestore(
       existingDoc = snap.data() as CustomerLedgerDoc;
       for (const oldEntry of existingDoc.archivedBills || []) {
         if (oldEntry?.receiptNumber) {
-          finalizedMap.set(oldEntry.receiptNumber, oldEntry);
+          billMap.set(oldEntry.receiptNumber, oldEntry);
         }
       }
     }
@@ -231,28 +266,32 @@ export async function syncCustomerLedgerToFirestore(
     // ignore read miss
   }
 
-  // Upsert / remove entries based on live enriched bills
   for (const bill of enrichedBills) {
     const recNo = String(bill.receiptNumber || '').trim();
     if (!recNo) continue;
 
-    if (bill.billStatus === 'due' || bill.billStatus === 'partial') {
-      // If a bill was reverted via Undo settlement, ensure it is removed from settled archive
-      finalizedMap.delete(recNo);
-      continue;
-    }
+    const isDue = bill.billStatus === 'due' || bill.billStatus === 'partial';
+    const payMethods =
+      bill.settlements.length > 0
+        ? bill.settlements.map((s) => s.settlementMethod.toUpperCase()).join('+')
+        : bill.payments
+            .map((p) => p.type)
+            .filter(Boolean)
+            .join(', ') || (isDue ? 'Credit' : 'Cash');
 
-    const payMethods = bill.settlements.length > 0
-      ? bill.settlements.map((s) => s.settlementMethod.toUpperCase()).join('+')
-      : bill.payments.map((p) => p.type).filter(Boolean).join(', ') || 'Cash';
-
-    finalizedMap.set(recNo, {
+    billMap.set(recNo, {
       receiptNumber: recNo.slice(0, 64),
       receiptType: String(bill.receiptType || 'SALE').slice(0, 32),
       dateTime: String(bill.dateTime || '').slice(0, 64),
       totalMoney: round3(Math.max(0, Number(bill.totalMoney || 0))),
-      creditAmount: 0,
-      paidAmount: round3(Math.max(0, Number(bill.billStatus === 'refund' ? 0 : bill.totalMoney || 0))),
+      creditAmount: isDue
+        ? round3(Math.max(0, Number(bill.originalCreditAmount || bill.creditAmount || 0)))
+        : 0,
+      paidAmount: isDue
+        ? round3(Math.max(0, Number(bill.posPaidAmount || bill.paidAmount || 0)))
+        : round3(
+            Math.max(0, Number(bill.billStatus === 'refund' ? 0 : bill.totalMoney || 0))
+          ),
       billStatus: bill.billStatus,
       paymentSummary: payMethods.slice(0, 64),
       itemCount: Array.isArray(bill.items) ? bill.items.length : 0,
@@ -260,28 +299,66 @@ export async function syncCustomerLedgerToFirestore(
     });
   }
 
-  const allFinalized = Array.from(finalizedMap.values()).sort((a, b) =>
+  // Prioritize open due/partial bills first, then sort newest-first within cap of 350
+  const allBills = Array.from(billMap.values()).sort((a, b) => {
+    const aDue = a.billStatus === 'due' || a.billStatus === 'partial' ? 1 : 0;
+    const bDue = b.billStatus === 'due' || b.billStatus === 'partial' ? 1 : 0;
+    if (aDue !== bDue) return bDue - aDue;
+    return a.dateTime < b.dateTime ? 1 : -1;
+  });
+
+  const cappedBills = allBills.slice(0, MAX_FIRESTORE_ARCHIVED_BILLS).sort((a, b) =>
     a.dateTime < b.dateTime ? 1 : -1
   );
-  const cappedArchived = allFinalized.slice(0, MAX_FIRESTORE_ARCHIVED_BILLS);
-  const lastFinalizedAt = cappedArchived[0]?.dateTime || '';
+
+  const finalizedOnly = allBills.filter(
+    (b) => b.billStatus !== 'due' && b.billStatus !== 'partial'
+  );
+  const lastFinalizedAt = finalizedOnly
+    .map((b) => b.dateTime)
+    .sort((a, b) => (a < b ? 1 : -1))[0] || '';
+
   const totalArchivedBills = Math.max(
-    allFinalized.length,
+    allBills.length,
     Number(existingDoc?.totalArchivedBills || 0)
   );
   const totalArchivedPaidAmount = round3(
-    allFinalized
+    finalizedOnly
       .filter((b) => b.billStatus !== 'refund')
       .reduce((s, b) => s + Number(b.totalMoney || 0), 0)
   );
 
-  // Skip write if archive state is already identical
+  const nextCreditLimit =
+    meta?.creditLimit !== undefined ? meta.creditLimit : existingDoc?.creditLimit ?? null;
+  const nextHasCreditLimit = nextCreditLimit !== null && nextCreditLimit !== undefined;
+  const nextTotalVisits =
+    meta?.totalVisits !== undefined
+      ? Math.max(0, Math.floor(Number(meta.totalVisits || 0)))
+      : existingDoc?.totalVisits;
+  const nextTotalSpent =
+    meta?.totalSpent !== undefined
+      ? round3(Math.max(0, Number(meta.totalSpent || 0)))
+      : existingDoc?.totalSpent;
+  const nextFirstVisit =
+    meta?.firstVisit !== undefined ? String(meta.firstVisit || '').slice(0, 64) : existingDoc?.firstVisit;
+  const nextCustomerName =
+    meta?.customerName !== undefined
+      ? String(meta.customerName || '').slice(0, 120)
+      : existingDoc?.customerName;
+  const nextCustomerPhone =
+    meta?.customerPhone !== undefined
+      ? String(meta.customerPhone || '').slice(0, 30)
+      : existingDoc?.customerPhone;
+
+  // Skip write if archive & metadata state is already identical
   if (
     existingDoc &&
     existingDoc.lastFinalizedAt === lastFinalizedAt &&
     existingDoc.totalArchivedBills === totalArchivedBills &&
-    existingDoc.archivedBills?.length === cappedArchived.length &&
-    existingDoc.archivedBills?.[0]?.billStatus === cappedArchived[0]?.billStatus &&
+    existingDoc.archivedBills?.length === cappedBills.length &&
+    existingDoc.archivedBills?.[0]?.billStatus === cappedBills[0]?.billStatus &&
+    (existingDoc.creditLimit ?? null) === (nextCreditLimit ?? null) &&
+    (existingDoc.totalVisits ?? null) === (nextTotalVisits ?? null) &&
     Math.abs(Number(existingDoc.totalArchivedPaidAmount || 0) - totalArchivedPaidAmount) < 0.001
   ) {
     return false;
@@ -289,10 +366,16 @@ export async function syncCustomerLedgerToFirestore(
 
   const payload: CustomerLedgerDoc = {
     customerCode: String(customerCode).trim().slice(0, 32),
+    ...(nextCustomerName ? { customerName: nextCustomerName } : {}),
+    ...(nextCustomerPhone ? { customerPhone: nextCustomerPhone } : {}),
+    ...(nextHasCreditLimit ? { creditLimit: nextCreditLimit, hasCreditLimit: true } : { hasCreditLimit: false }),
+    ...(nextTotalVisits !== undefined ? { totalVisits: nextTotalVisits } : {}),
+    ...(nextTotalSpent !== undefined ? { totalSpent: nextTotalSpent } : {}),
+    ...(nextFirstVisit ? { firstVisit: nextFirstVisit } : {}),
     lastFinalizedAt: lastFinalizedAt.slice(0, 64),
     totalArchivedBills,
     totalArchivedPaidAmount,
-    archivedBills: cappedArchived,
+    archivedBills: cappedBills,
     createdAt: existingDoc?.createdAt || now,
     updatedAt: now,
   };

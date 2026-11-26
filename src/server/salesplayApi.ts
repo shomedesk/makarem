@@ -845,6 +845,58 @@ export async function handleSalesPlayRequest(
       return true;
     }
 
+    // 2.2b1 Bulk export of all customers + their POS receipts for Admin Firestore sync
+    if (pathname === '/api/salesplay/export-customer-snapshots' && req.method === 'GET') {
+      const forceRefresh = parsedUrl.searchParams.get('force') === '1';
+      const [customers] = await Promise.all([
+        getCustomersCached(forceRefresh),
+        ensureReceiptsSynced(forceRefresh),
+      ]);
+
+      const snapshots = customers.map((c: any) => {
+        const custId = String(c.id || '').trim();
+        const custCode = String(c.customer_code || '').trim();
+        const creditLimitRaw = c.credit_limit;
+        const hasCreditLimit =
+          creditLimitRaw !== undefined &&
+          creditLimitRaw !== null &&
+          String(creditLimitRaw).trim() !== '' &&
+          !Number.isNaN(Number(creditLimitRaw));
+        const creditLimit = hasCreditLimit ? Number(creditLimitRaw) : null;
+
+        const custReceipts = Array.from(receiptIndex.byNumber.values())
+          .filter((r) => {
+            if (custId && r.customerId === custId) return true;
+            if (custCode && r.customerCode === custCode) return true;
+            return false;
+          })
+          .sort((a, b) => (a.dateTime < b.dateTime ? 1 : -1))
+          .map(({ customerId: _cid, customerCode: _ccode, ...rest }) => rest);
+
+        return {
+          id: custId,
+          customerCode: custCode,
+          name: String(c.name || '').trim(),
+          phone: String(c.phone_number || '').trim(),
+          phoneNormalized: normalizePhoneDigits(c.phone_number || ''),
+          creditLimit,
+          hasCreditLimit,
+          totalVisits: Number(c.total_visits || 0),
+          totalSpent: Number(c.total_spent || 0),
+          firstVisit: String(c.first_visit || ''),
+          lastVisit: String(c.last_visit || ''),
+          receipts: custReceipts,
+        };
+      });
+
+      sendJson(res, 200, {
+        success: true,
+        count: snapshots.length,
+        snapshots,
+      });
+      return true;
+    }
+
     // 2.2b2 Admin Store & Credit Analytics (powered by incremental receiptIndex, zero extra Firestore reads)
     if (pathname === '/api/salesplay/admin-insights' && req.method === 'GET') {
       const forceRefresh = parsedUrl.searchParams.get('force') === '1';

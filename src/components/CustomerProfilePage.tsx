@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import type {
   CreditSettlementRecord,
+  CustomerLedgerDoc,
   CustomerProfile,
   Order,
   SalesPlayCustomerProfileResponse,
@@ -79,6 +80,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [appOrders, setAppOrders] = useState<Order[]>([]);
   const [posProfile, setPosProfile] = useState<SalesPlayCustomerProfileResponse | null>(null);
+  const [ledgerMeta, setLedgerMeta] = useState<CustomerLedgerDoc | null>(null);
   const [mergedReceipts, setMergedReceipts] = useState<SalesPlayCustomerReceipt[]>([]);
   const [settlements, setSettlements] = useState<CreditSettlementRecord[]>([]);
   const [expandedBills, setExpandedBills] = useState<Record<string, boolean>>({});
@@ -88,12 +90,10 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
     try {
       const localArchive = loadLocalBillArchive(cust.customerCode);
 
-      // Hydrate immediately from device archive if available so UI renders without waiting
       if (localArchive?.receipts?.length) {
         setMergedReceipts(localArchive.receipts);
       }
 
-      // 1-doc Firestore ledger read + customer online orders + initial settlements
       const [ordersList, ledgerDoc, initialSettlements] = await Promise.all([
         fetchCustomerOrders(cust.phone, cust.customerCode),
         fetchCustomerLedgerDoc(cust.customerCode),
@@ -101,9 +101,9 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
       ]);
 
       setAppOrders(ordersList);
+      setLedgerMeta(ledgerDoc);
       setSettlements(initialSettlements);
 
-      // Compute baseline archive state to ask SalesPlay ONLY for new + open DUE bills
       const preMerge = mergeArchivedAndDeltaReceipts({
         ledgerDoc,
         localArchive,
@@ -124,7 +124,6 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
         setPosProfile(spData);
         const canonicalCode = spData.customer?.customerCode || cust.customerCode;
 
-        // If canonical POS customerCode differs from profile code, merge its ledger/local archive too
         let canonicalLedger = ledgerDoc;
         let canonicalLocal = localArchive;
         if (canonicalCode && canonicalCode !== cust.customerCode) {
@@ -133,6 +132,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
             fetchCustomerSettlements(canonicalCode),
           ]);
           canonicalLedger = extraLedger || ledgerDoc;
+          setLedgerMeta(canonicalLedger);
           canonicalLocal = loadLocalBillArchive(canonicalCode) || localArchive;
           if (extraSettlements.length > 0) {
             setSettlements(extraSettlements);
@@ -166,6 +166,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
     } else {
       setAppOrders([]);
       setPosProfile(null);
+      setLedgerMeta(null);
       setMergedReceipts([]);
       setSettlements([]);
     }
@@ -199,10 +200,15 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
     return () => unsub();
   }, [effectiveCustomerCode, hasOpenCreditOrSettlements]);
 
+  const effectiveCreditLimit =
+    posProfile?.creditSummary?.creditLimit ??
+    ledgerMeta?.creditLimit ??
+    profile?.creditLimit ??
+    null;
+
   const enrichedSummary = useMemo(() => {
-    const limitVal = posProfile?.creditSummary?.creditLimit ?? null;
-    return computeEnrichedCustomerBills(mergedReceipts, settlements, limitVal);
-  }, [mergedReceipts, posProfile?.creditSummary?.creditLimit, settlements]);
+    return computeEnrichedCustomerBills(mergedReceipts, settlements, effectiveCreditLimit);
+  }, [mergedReceipts, effectiveCreditLimit, settlements]);
 
   const displayedBills = useMemo(() => {
     if (billFilter === 'due') return enrichedSummary.dueBills;
@@ -353,11 +359,23 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
   }
 
   const spCustomer = posProfile?.customer;
-  const credit = posProfile?.creditSummary;
+  const hasEffectiveCreditLimit =
+    effectiveCreditLimit !== null && effectiveCreditLimit !== undefined;
   const displayName =
     spCustomer?.name ||
+    ledgerMeta?.customerName ||
     profile.name ||
     (isAr ? `عميل مكارم #${profile.customerCode}` : `Makarem Customer #${profile.customerCode}`);
+  const displayPhone = spCustomer?.phone || ledgerMeta?.customerPhone || profile.phone || '';
+  const displayFirstVisit = spCustomer?.firstVisit || ledgerMeta?.firstVisit || profile.firstVisit || '';
+  const displayTotalVisits =
+    spCustomer?.totalVisits ??
+    ledgerMeta?.totalVisits ??
+    profile.totalVisits ??
+    Math.max(enrichedSummary.bills.length, appOrders.length);
+  const isVerifiedMember = Boolean(
+    posProfile?.matched || ledgerMeta || profile.salesplayCustomerId
+  );
 
   return (
     <div className="max-w-5xl mx-auto py-4 space-y-6">
@@ -412,7 +430,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-xl sm:text-2xl font-extrabold">{displayName}</h1>
-              {posProfile?.matched && (
+              {isVerifiedMember && (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[11px] font-bold">
                   <CheckCircle2 className="w-3 h-3" />
                   <span>{isAr ? 'بطاقة عائلة موثقة' : 'Verified Member'}</span>
@@ -424,16 +442,16 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
                 <Hash className="w-3.5 h-3.5 text-emerald-400" />
                 ID: {spCustomer?.customerCode || profile.customerCode}
               </span>
-              {(spCustomer?.phone || profile.phone) && (
+              {displayPhone && (
                 <span className="inline-flex items-center gap-1">
                   <Phone className="w-3.5 h-3.5 text-emerald-400" />
-                  {spCustomer?.phone || profile.phone}
+                  {displayPhone}
                 </span>
               )}
-              {spCustomer?.firstVisit && (
+              {displayFirstVisit && (
                 <span className="inline-flex items-center gap-1">
                   <Calendar className="w-3.5 h-3.5 text-emerald-400" />
-                  {isAr ? 'أول زيارة:' : 'Member since'} {spCustomer.firstVisit}
+                  {isAr ? 'أول زيارة:' : 'Member since'} {displayFirstVisit}
                 </span>
               )}
             </div>
@@ -462,7 +480,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
               {isAr ? 'الزيارات' : 'Visits'}
             </div>
             <div className="text-lg font-black text-white font-mono tabular-nums">
-              {spCustomer?.totalVisits ?? appOrders.length}
+              {displayTotalVisits}
             </div>
           </div>
         </div>
@@ -470,8 +488,8 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
 
       {/* Credit Pie / Donut Chart synced 1:1 with live settlement state */}
       <CreditPieChart
-        hasCreditLimit={Boolean(credit?.hasCreditLimit)}
-        creditLimit={credit?.creditLimit ?? null}
+        hasCreditLimit={hasEffectiveCreditLimit}
+        creditLimit={effectiveCreditLimit}
         creditUsed={enrichedSummary.totalDueNow}
         remainingCredit={enrichedSummary.remainingCredit}
         dueBillsCount={enrichedSummary.dueBills.length}

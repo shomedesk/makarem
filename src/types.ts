@@ -81,6 +81,10 @@ export interface CustomerProfile {
   phoneNormalized?: string;
   name?: string;
   salesplayCustomerId?: string;
+  creditLimit?: number | null;
+  totalVisits?: number;
+  totalSpent?: number;
+  firstVisit?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -96,6 +100,7 @@ export interface AdminCustomerRecord {
   creditLimit: number | null;
   totalSpent: number;
   totalVisits: number;
+  firstVisit?: string;
   source: 'both' | 'salesplay' | 'firestore';
   createdAt?: string;
   updatedAt?: string;
@@ -153,7 +158,7 @@ export interface ArchivedBillEntry {
   totalMoney: number;
   creditAmount: number;
   paidAmount: number;
-  billStatus: 'paid' | 'settled' | 'refund';
+  billStatus: 'due' | 'partial' | 'paid' | 'settled' | 'refund';
   paymentSummary: string;
   itemCount: number;
   archivedAt: string;
@@ -161,6 +166,13 @@ export interface ArchivedBillEntry {
 
 export interface CustomerLedgerDoc {
   customerCode: string;
+  customerName?: string;
+  customerPhone?: string;
+  creditLimit?: number | null;
+  hasCreditLimit?: boolean;
+  totalVisits?: number;
+  totalSpent?: number;
+  firstVisit?: string;
   lastFinalizedAt: string;
   totalArchivedBills: number;
   totalArchivedPaidAmount: number;

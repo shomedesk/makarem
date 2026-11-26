@@ -571,7 +571,7 @@ export default function App() {
       return;
     }
 
-    // Ensure Firestore catalog_snapshot & POS customer profiles exist for offline/static launches
+    // Ensure Firestore catalog_snapshot & POS customer ledgers exist for offline/static launches
     fetchCatalogPushMeta()
       .then(async (meta) => {
         if (!meta) {
@@ -586,7 +586,17 @@ export default function App() {
               // ignore
             }
           }
-          await syncAllSalesPlayCustomersToFirestore().catch(() => null);
+        }
+        const ledgerBootstrapDone = localStorage.getItem('makarem_cust_ledger_sync_v2') === '1';
+        if (!meta || !ledgerBootstrapDone) {
+          const syncedCount = await syncAllSalesPlayCustomersToFirestore({ syncLedgers: true }).catch(() => 0);
+          if (syncedCount > 0) {
+            try {
+              localStorage.setItem('makarem_cust_ledger_sync_v2', '1');
+            } catch {
+              // ignore
+            }
+          }
         }
       })
       .catch(() => null);

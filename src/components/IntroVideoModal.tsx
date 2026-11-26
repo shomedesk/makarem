@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Volume2, X, Play } from 'lucide-react';
+import { Volume2, X, Play, Smartphone, Monitor } from 'lucide-react';
 
 interface IntroVideoModalProps {
   videoUrl: string;
@@ -29,6 +29,19 @@ export function extractYouTubeVideoId(rawUrl: string): string | null {
   return null;
 }
 
+export function isReelOrVerticalUrl(rawUrl: string): boolean {
+  const url = String(rawUrl || '').trim().toLowerCase();
+  if (!url) return false;
+  return (
+    url.includes('youtube.com/shorts/') ||
+    url.includes('/shorts/') ||
+    url.includes('instagram.com/reel') ||
+    url.includes('tiktok.com/') ||
+    /[?&](?:ratio|aspect)=9[:x_-]?16/i.test(url) ||
+    /[?&]reel=1/i.test(url)
+  );
+}
+
 export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
   videoUrl,
   isOpen,
@@ -39,8 +52,19 @@ export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const ytPlayerRef = useRef<any>(null);
   const [needsSoundTap, setNeedsSoundTap] = useState(false);
+  const [ratioOverride, setRatioOverride] = useState<'portrait' | 'landscape' | null>(null);
+  const [detectedMp4Portrait, setDetectedMp4Portrait] = useState(false);
 
   const youtubeId = extractYouTubeVideoId(videoUrl);
+  const isPortrait =
+    ratioOverride !== null
+      ? ratioOverride === 'portrait'
+      : isReelOrVerticalUrl(videoUrl) || detectedMp4Portrait;
+
+  useEffect(() => {
+    setRatioOverride(null);
+    setDetectedMp4Portrait(false);
+  }, [videoUrl]);
 
   useEffect(() => {
     if (!isOpen || !youtubeId) return;
@@ -60,6 +84,8 @@ export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
       }
 
       ytPlayerRef.current = new YT.Player(playerContainerRef.current, {
+        width: '100%',
+        height: '100%',
         videoId: youtubeId,
         playerVars: {
           autoplay: 1,
@@ -74,7 +100,6 @@ export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
               ev.target.unMute();
               ev.target.setVolume(100);
               ev.target.playVideo();
-              // Verify shortly after whether browser paused/blocked unmuted autoplay
               setTimeout(() => {
                 if (cancelled) return;
                 try {
@@ -94,7 +119,6 @@ export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
             if (ev.data === 1) {
               setNeedsSoundTap(false);
             }
-            // YT.PlayerState.ENDED === 0 -> auto close popup cleanly when video finishes
             if (ev.data === 0) {
               onClose();
             }
@@ -147,29 +171,54 @@ export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/80 backdrop-blur-sm">
-      <div className="relative w-full max-w-2xl bg-slate-900 rounded-3xl overflow-hidden shadow-2xl border border-white/15 animate-fadeIn">
-        {/* Top Bar with Prominent Close Button */}
-        <div className="flex items-center justify-between px-4 py-3 bg-slate-950/90 text-white border-b border-white/10">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/85 backdrop-blur-sm">
+      <div
+        style={
+          isPortrait
+            ? { width: 'min(92vw, calc(76vh * 9 / 16))', maxWidth: '400px' }
+            : undefined
+        }
+        className={`relative bg-slate-900 rounded-3xl overflow-hidden shadow-2xl border border-white/15 animate-fadeIn ${
+          isPortrait ? 'mx-auto' : 'w-full max-w-2xl'
+        }`}
+      >
+        {/* Top Bar with Ratio Toggle & Prominent Close Button */}
+        <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 bg-slate-950/95 text-white border-b border-white/10">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
             <span className="font-extrabold text-xs sm:text-sm truncate">
-              {isAr ? 'أهلاً بكم في بقالة مكارم الخير الحديثة' : 'Welcome to Makarem Al-Khair Modern'}
+              {isAr ? 'مكارم الخير الحديثة' : 'Makarem Al-Khair'}
             </span>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/15 hover:bg-rose-600 text-white text-xs font-extrabold transition cursor-pointer shrink-0"
-          >
-            <X className="w-4 h-4" />
-            <span>{isAr ? 'إغلاق' : 'Close'}</span>
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setRatioOverride(isPortrait ? 'landscape' : 'portrait')}
+              title={isPortrait ? 'Switch to 16:9 Wide' : 'Switch to 9:16 Reel'}
+              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-slate-200 text-[11px] font-bold transition cursor-pointer"
+            >
+              {isPortrait ? <Monitor className="w-3.5 h-3.5" /> : <Smartphone className="w-3.5 h-3.5" />}
+              <span>{isPortrait ? '16:9' : '9:16'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onClose}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-rose-600 text-white text-xs font-extrabold transition cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+              <span>{isAr ? 'إغلاق' : 'Close'}</span>
+            </button>
+          </div>
         </div>
 
-        {/* Centered Responsive Video Frame */}
-        <div className="relative aspect-video bg-black flex items-center justify-center">
+        {/* Centered Responsive 9:16 Reel or 16:9 Wide Frame */}
+        <div
+          className={`relative bg-black flex items-center justify-center overflow-hidden [&_iframe]:w-full [&_iframe]:h-full [&_iframe]:block ${
+            isPortrait ? 'aspect-[9/16] w-full' : 'aspect-video w-full'
+          }`}
+        >
           {youtubeId ? (
             <>
               <div ref={playerContainerRef} className="w-full h-full" />
@@ -195,6 +244,12 @@ export const IntroVideoModal: React.FC<IntroVideoModalProps> = ({
               autoPlay
               controls
               playsInline
+              onLoadedMetadata={(e) => {
+                const v = e.currentTarget;
+                if (v.videoHeight > v.videoWidth) {
+                  setDetectedMp4Portrait(true);
+                }
+              }}
               onEnded={onClose}
               className="w-full h-full object-contain"
             />

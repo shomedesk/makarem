@@ -106,6 +106,10 @@
         "phoneNormalized": { "type": "string", "maxLength": 30 },
         "name": { "type": "string", "maxLength": 120 },
         "salesplayCustomerId": { "type": "string", "maxLength": 128 },
+        "creditLimit": { "type": "number" },
+        "totalVisits": { "type": "number" },
+        "totalSpent": { "type": "number" },
+        "firstVisit": { "type": "string", "maxLength": 64 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -193,16 +197,23 @@
     },
     "CustomerLedger": {
       "title": "CustomerLedger",
-      "description": "Compact 1-doc-per-customer archive of finalized Paid and Settled bills to prevent 10,000-doc Firestore reads",
+      "description": "Compact 1-doc-per-customer snapshot of bills, due balance, and credit metadata to guarantee offline/launched customer dashboards",
       "type": "object",
       "properties": {
         "customerCode": { "type": "string", "maxLength": 32 },
+        "customerName": { "type": "string", "maxLength": 120 },
+        "customerPhone": { "type": "string", "maxLength": 30 },
+        "creditLimit": { "type": "number" },
+        "hasCreditLimit": { "type": "boolean" },
+        "totalVisits": { "type": "number" },
+        "totalSpent": { "type": "number" },
+        "firstVisit": { "type": "string", "maxLength": 64 },
         "lastFinalizedAt": { "type": "string", "maxLength": 64 },
         "totalArchivedBills": { "type": "number" },
         "totalArchivedPaidAmount": { "type": "number" },
         "archivedBills": {
           "type": "array",
-          "description": "Compact native map summaries of finalized Cash/Card/Settled bills (max 350)"
+          "description": "Compact native map summaries of customer bills including open due and paid/settled bills (max 350)"
         },
         "updatedAt": { "type": "string", "format": "date-time" },
         "createdAt": { "type": "string", "format": "date-time" }

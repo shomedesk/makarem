@@ -99,10 +99,19 @@ service cloud.firestore {
           'totalArchivedPaidAmount', 'archivedBills', 'updatedAt', 'createdAt'
         ])
         && data.keys().hasOnly([
-          'customerCode', 'lastFinalizedAt', 'totalArchivedBills',
-          'totalArchivedPaidAmount', 'archivedBills', 'updatedAt', 'createdAt'
+          'customerCode', 'customerName', 'customerPhone', 'creditLimit',
+          'hasCreditLimit', 'totalVisits', 'totalSpent', 'firstVisit',
+          'lastFinalizedAt', 'totalArchivedBills', 'totalArchivedPaidAmount',
+          'archivedBills', 'updatedAt', 'createdAt'
         ])
         && data.customerCode is string && data.customerCode.size() > 0 && data.customerCode.size() <= 32
+        && (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 120))
+        && (!('customerPhone' in data) || (data.customerPhone is string && data.customerPhone.size() <= 30))
+        && (!('creditLimit' in data) || data.creditLimit == null || (data.creditLimit is number && data.creditLimit >= 0 && data.creditLimit <= 1000000))
+        && (!('hasCreditLimit' in data) || data.hasCreditLimit is bool)
+        && (!('totalVisits' in data) || (data.totalVisits is int && data.totalVisits >= 0 && data.totalVisits <= 1000000))
+        && (!('totalSpent' in data) || (data.totalSpent is number && data.totalSpent >= 0 && data.totalSpent <= 10000000))
+        && (!('firstVisit' in data) || (data.firstVisit is string && data.firstVisit.size() <= 64))
         && data.lastFinalizedAt is string && data.lastFinalizedAt.size() <= 64
         && data.totalArchivedBills is int && data.totalArchivedBills >= 0 && data.totalArchivedBills <= 1000000
         && data.totalArchivedPaidAmount is number && data.totalArchivedPaidAmount >= 0
@@ -212,7 +221,9 @@ service cloud.firestore {
         && incoming().customerCode == existing().customerCode
         && incoming().createdAt == existing().createdAt
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'lastFinalizedAt', 'totalArchivedBills', 'totalArchivedPaidAmount', 'archivedBills', 'updatedAt'
+          'customerName', 'customerPhone', 'creditLimit', 'hasCreditLimit',
+          'totalVisits', 'totalSpent', 'firstVisit', 'lastFinalizedAt',
+          'totalArchivedBills', 'totalArchivedPaidAmount', 'archivedBills', 'updatedAt'
         ]);
       allow delete: if isValidId(customerCode) && isAdmin();
     }
