@@ -15,9 +15,13 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
   const distPath = path.resolve(__dirname, 'dist');
   const distIndex = path.join(distPath, 'index.html');
+  const isExplicitDev =
+    process.env.npm_lifecycle_event === 'dev' ||
+    process.argv.some((arg) => arg.includes('tsx')) ||
+    (process.env.NODE_ENV === 'development' && !fs.existsSync(distIndex));
   const isProd =
     process.env.NODE_ENV === 'production' ||
-    (process.env.NODE_ENV !== 'development' && fs.existsSync(distIndex));
+    (!isExplicitDev && fs.existsSync(distIndex));
 
   // Parse JSON payloads
   app.use(express.json());

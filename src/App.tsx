@@ -302,9 +302,12 @@ export default function App() {
             params.set('sinceVersion', localVersion);
           }
 
+          const controller = new AbortController();
+          const timeoutId = window.setTimeout(() => controller.abort(), 12000);
           const res = await fetch(`/api/salesplay/products?${params.toString()}`, {
             cache: 'no-store',
-          });
+            signal: controller.signal,
+          }).finally(() => window.clearTimeout(timeoutId));
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
 
