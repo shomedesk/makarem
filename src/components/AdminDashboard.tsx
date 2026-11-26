@@ -32,6 +32,12 @@ import {
   BarChart3,
   AlertTriangle,
   TrendingUp,
+  Tag,
+  Video,
+  Flame,
+  Play,
+  Eye,
+  Pause,
 } from 'lucide-react';
 import QRCode from 'qrcode';
 import type {
@@ -42,6 +48,7 @@ import type {
   OrderStatus,
   InventoryItem,
   SalesPlayShop,
+  StoreOffer,
 } from '../types';
 import {
   updateOrderInFirestore,
@@ -73,6 +80,7 @@ import {
 import { ImageUploadModal } from './ImageUploadModal';
 import { QrBarcodeScannerModal } from './QrBarcodeScannerModal';
 import { CustomerCreditSettlementModal } from './CustomerCreditSettlementModal';
+import { IntroVideoModal } from './IntroVideoModal';
 
 interface AdminDashboardProps {
   orders: Order[];
@@ -88,6 +96,13 @@ interface AdminDashboardProps {
   onToggleAutoPrint: (enabled: boolean) => void;
   whatsappNumber: string;
   onSaveWhatsAppNumber: (phone: string) => Promise<string>;
+  introVideoUrl: string;
+  onSaveIntroVideo: (url: string) => Promise<{
+    introVideoUrl: string;
+    introVideoVersion: string;
+  }>;
+  offers: StoreOffer[];
+  onSaveOffers: (offers: StoreOffer[]) => Promise<StoreOffer[]>;
   language: 'en' | 'ar';
   salesplayShop: SalesPlayShop | null;
 }
@@ -101,6 +116,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onToggleAutoPrint,
   whatsappNumber,
   onSaveWhatsAppNumber,
+  introVideoUrl,
+  onSaveIntroVideo,
+  offers,
+  onSaveOffers,
   language,
   salesplayShop,
 }) => {
@@ -110,7 +129,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [inventorySearch, setInventorySearch] = useState('');
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'orders' | 'customers' | 'reports' | 'inventory' | 'salesplay'>('orders');
+  const [activeTab, setActiveTab] = useState<'orders' | 'customers' | 'reports' | 'inventory' | 'offers' | 'salesplay'>('orders');
   const [inventoryFilter, setInventoryFilter] = useState<'all' | 'low_stock' | 'out_of_stock' | 'no_arabic' | 'no_photo'>('all');
   const [customerFilter, setCustomerFilter] = useState<'all' | 'with_due' | 'near_limit' | 'synced'>('all');
   const [reportPeriod, setReportPeriod] = useState<'today' | 'd7' | 'd30' | 'd90'>('today');
@@ -143,6 +162,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   useEffect(() => {
     setWaInput(whatsappNumber);
   }, [whatsappNumber]);
+
+  // Customer Intro Video editor state
+  const [videoInput, setVideoInput] = useState<string>(introVideoUrl);
+  const [isSavingVideo, setIsSavingVideo] = useState(false);
+  const [videoStatusMsg, setVideoStatusMsg] = useState<string | null>(null);
+  const [showPreviewVideo, setShowPreviewVideo] = useState(false);
+
+  useEffect(() => {
+    setVideoInput(introVideoUrl);
+  }, [introVideoUrl]);
+
+  // Today's Offers manager state
+  const [offerTitleEn, setOfferTitleEn] = useState('');
+  const [offerTitleAr, setOfferTitleAr] = useState('');
+  const [offerSubtitleEn, setOfferSubtitleEn] = useState('');
+  const [offerSubtitleAr, setOfferSubtitleAr] = useState('');
+  const [offerBadge, setOfferBadge] = useState('HOT DEAL');
+  const [offerAccent, setOfferAccent] = useState<'emerald' | 'amber' | 'rose' | 'slate'>('rose');
+  const [offerProductId, setOfferProductId] = useState('');
+  const [offerProdSearch, setOfferProdSearch] = useState('');
+  const [offerPriceInput, setOfferPriceInput] = useState('');
+  const [offerCategoryFilter, setOfferCategoryFilter] = useState('');
+  const [isSavingOffers, setIsSavingOffers] = useState(false);
+  const [offerStatusMsg, setOfferStatusMsg] = useState<string | null>(null);
 
   // Customers Management Tab state
   const [customers, setCustomers] = useState<AdminCustomerRecord[]>([]);
@@ -490,6 +533,99 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setWaStatusMsg(err?.message || 'Could not save WhatsApp number');
     } finally {
       setIsSavingWa(false);
+    }
+  };
+
+  const handleSaveIntroVideoSetting = async (e?: React.FormEvent, explicitUrl?: string) => {
+    if (e) e.preventDefault();
+    setIsSavingVideo(true);
+    setVideoStatusMsg(null);
+    try {
+      const target = explicitUrl !== undefined ? explicitUrl : videoInput;
+      const saved = await onSaveIntroVideo(target);
+      setVideoInput(saved.introVideoUrl);
+      setVideoStatusMsg(
+        saved.introVideoUrl
+          ? isAr
+            ? 'تم حفظ الفيديو الترحيبي — سيظهر مرة واحدة فقط للعملاء عند الفتح القادم.'
+            : 'Saved intro video! All customers will see it 1 time only on their next app open.'
+          : isAr
+          ? 'تم إيقاف الفيديو الترحيبي بنجاح.'
+          : 'Intro video disabled.'
+      );
+      setTimeout(() => setVideoStatusMsg(null), 5000);
+    } catch (err: any) {
+      setVideoStatusMsg(err?.message || 'Could not save intro video URL');
+    } finally {
+      setIsSavingVideo(false);
+    }
+  };
+
+  const handleAddOffer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!offerTitleEn.trim() && !offerTitleAr.trim()) return;
+    setIsSavingOffers(true);
+    setOfferStatusMsg(null);
+    try {
+      const parsedOfferPrice = offerPriceInput.trim()
+        ? Math.round(parseFloat(offerPriceInput) * 1000) / 1000
+        : undefined;
+
+      const newOffer: StoreOffer = {
+        id: `offer_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        titleEn: offerTitleEn.trim() || offerTitleAr.trim(),
+        titleAr: offerTitleAr.trim() || offerTitleEn.trim(),
+        subtitleEn: offerSubtitleEn.trim() || undefined,
+        subtitleAr: offerSubtitleAr.trim() || undefined,
+        badgeText: offerBadge.trim() || 'HOT DEAL',
+        accentColor: offerAccent,
+        productId: offerProductId || undefined,
+        categoryFilter: !offerProductId && offerCategoryFilter ? offerCategoryFilter : undefined,
+        offerPrice:
+          parsedOfferPrice && !Number.isNaN(parsedOfferPrice) && parsedOfferPrice > 0
+            ? parsedOfferPrice
+            : undefined,
+        active: true,
+        createdAt: new Date().toISOString(),
+      };
+
+      await onSaveOffers([newOffer, ...offers]);
+      setOfferTitleEn('');
+      setOfferTitleAr('');
+      setOfferSubtitleEn('');
+      setOfferSubtitleAr('');
+      setOfferProductId('');
+      setOfferProdSearch('');
+      setOfferPriceInput('');
+      setOfferCategoryFilter('');
+      setOfferStatusMsg(
+        isAr ? 'تم نشر العرض على واجهة العملاء!' : 'Offer published to customer storefront!'
+      );
+      setTimeout(() => setOfferStatusMsg(null), 4000);
+    } catch (err: any) {
+      setOfferStatusMsg(err?.message || 'Could not save offer');
+    } finally {
+      setIsSavingOffers(false);
+    }
+  };
+
+  const handleToggleOfferActive = async (offerId: string) => {
+    setIsSavingOffers(true);
+    try {
+      const next = offers.map((o) => (o.id === offerId ? { ...o, active: !o.active } : o));
+      await onSaveOffers(next);
+    } finally {
+      setIsSavingOffers(false);
+    }
+  };
+
+  const handleDeleteOffer = async (offerId: string) => {
+    setIsSavingOffers(true);
+    try {
+      const next = offers.filter((o) => o.id !== offerId);
+      await onSaveOffers(next);
+    } finally {
+      setIsSavingOffers(false);
     }
   };
 
@@ -977,6 +1113,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             {untranslatedCount > 0 && (
               <span className="px-1.5 py-0.5 text-[10px] rounded-md bg-amber-400 text-slate-950 font-mono font-bold">
                 {untranslatedCount} new
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('offers')}
+            className={`px-3.5 py-2 text-xs sm:text-sm font-bold rounded-xl transition whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
+              activeTab === 'offers'
+                ? 'bg-rose-600 text-white'
+                : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <Flame className="w-3.5 h-3.5" />
+            <span>{isAr ? 'العروض والفيديو' : 'Offers & Video'}</span>
+            {offers.filter((o) => o.active).length > 0 && (
+              <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-white text-rose-700 font-mono font-black">
+                {offers.filter((o) => o.active).length}
               </span>
             )}
           </button>
@@ -2164,6 +2318,366 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
+      {/* TAB 3B: TODAY'S OFFERS & CUSTOMER INTRO VIDEO POPUP */}
+      {activeTab === 'offers' && (() => {
+        const distinctCategories = Array.from(
+          new Set(
+            catalog
+              .map((c) => (!c.category || c.category === 'No category' ? 'Uncategorized' : c.category))
+              .filter(Boolean)
+          )
+        ).sort();
+
+        const offerProductMatches = offerProdSearch.trim()
+          ? catalog
+              .filter((p) => {
+                const q = offerProdSearch.toLowerCase();
+                return (
+                  p.name.toLowerCase().includes(q) ||
+                  (p.arabicName && p.arabicName.toLowerCase().includes(q)) ||
+                  (p.barcode && p.barcode.includes(q))
+                );
+              })
+              .slice(0, 40)
+          : catalog.slice(0, 40);
+
+        return (
+          <div className="space-y-5">
+            {/* TODAY'S OFFERS MANAGER (Blinkit / Flipkart Minutes / Temu Deal Cards) */}
+            <div className="bg-white rounded-2xl p-5 border border-slate-200 space-y-5">
+              <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center">
+                    <Tag className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-extrabold text-base text-slate-900">
+                      {isAr ? 'إدارة عروض اليوم (تظهر في واجهة المتجر)' : "Today's Offers & Flash Deals"}
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      {isAr
+                        ? 'أضف عروضاً مميزة أو خصومات يومية تظهر بأعلى صفحة المتجر للعملاء بضغطة زر.'
+                        : 'Publish daily deal cards on the storefront (Blinkit / Flipkart Minutes style) with 1-tap Add or category jump.'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <form onSubmit={handleAddOffer} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 p-4 rounded-2xl bg-slate-50 border border-slate-200">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'عنوان العرض (إنجليزي) *' : 'Offer Title (English) *'}
+                  </label>
+                  <input
+                    type="text"
+                    required={!offerTitleAr.trim()}
+                    value={offerTitleEn}
+                    onChange={(e) => setOfferTitleEn(e.target.value)}
+                    placeholder="e.g. Pepsi 6-Pack Super Saver"
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-semibold"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'عنوان العرض (عربي) *' : 'Offer Title (Arabic) *'}
+                  </label>
+                  <input
+                    type="text"
+                    value={offerTitleAr}
+                    onChange={(e) => setOfferTitleAr(e.target.value)}
+                    placeholder="مثال: عرض خاص على بيبسي 6 علب"
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-semibold"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'شارة العرض (Badge)' : 'Badge Label'}
+                  </label>
+                  <input
+                    type="text"
+                    value={offerBadge}
+                    onChange={(e) => setOfferBadge(e.target.value)}
+                    placeholder="HOT DEAL / 25% OFF"
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-extrabold uppercase"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'وصف إضافي (إنجليزي)' : 'Subtitle (English, optional)'}
+                  </label>
+                  <input
+                    type="text"
+                    value={offerSubtitleEn}
+                    onChange={(e) => setOfferSubtitleEn(e.target.value)}
+                    placeholder="Limited time today only"
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'وصف إضافي (عربي)' : 'Subtitle (Arabic, optional)'}
+                  </label>
+                  <input
+                    type="text"
+                    value={offerSubtitleAr}
+                    onChange={(e) => setOfferSubtitleAr(e.target.value)}
+                    placeholder="عرض ساري لليوم فقط"
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'لون بطاقة العرض' : 'Card Theme Color'}
+                  </label>
+                  <select
+                    value={offerAccent}
+                    onChange={(e) => setOfferAccent(e.target.value as any)}
+                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-bold"
+                  >
+                    <option value="rose">Crimson Red (Flash Deal)</option>
+                    <option value="emerald">Store Emerald Green</option>
+                    <option value="amber">Bright Yellow Gold (Blinkit)</option>
+                    <option value="slate">Dark Premium Slate</option>
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    {isAr ? 'ربط بمنتج معين (اختياري للإضافة السريعة)' : 'Link to Product (optional, enables 1-tap ADD)'}
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      value={offerProdSearch}
+                      onChange={(e) => setOfferProdSearch(e.target.value)}
+                      placeholder={isAr ? 'ابحث عن منتج...' : 'Filter product list...'}
+                      className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl"
+                    />
+                    <select
+                      value={offerProductId}
+                      onChange={(e) => setOfferProductId(e.target.value)}
+                      className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-medium"
+                    >
+                      <option value="">{isAr ? '-- بدون منتج محدد --' : '-- No specific product --'}</option>
+                      {offerProductMatches.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.price.toFixed(3)} OMR)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {offerProductId ? (
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      {isAr ? 'سعر العرض الخاص (OMR)' : 'Special Offer Price (OMR)'}
+                    </label>
+                    <input
+                      type="number"
+                      step="0.001"
+                      value={offerPriceInput}
+                      onChange={(e) => setOfferPriceInput(e.target.value)}
+                      placeholder="0.150"
+                      className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-mono font-bold"
+                    />
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      {isAr ? 'أو ربط بقسم عند الضغط' : 'Or Link to Category'}
+                    </label>
+                    <select
+                      value={offerCategoryFilter}
+                      onChange={(e) => setOfferCategoryFilter(e.target.value)}
+                      className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-medium"
+                    >
+                      <option value="">{isAr ? '-- بدون قسم --' : '-- Any category --'}</option>
+                      {distinctCategories.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className="sm:col-span-2 lg:col-span-3 flex items-center justify-between pt-1">
+                  {offerStatusMsg ? (
+                    <span className="text-xs font-bold text-emerald-700">{offerStatusMsg}</span>
+                  ) : (
+                    <span className="text-[11px] text-slate-500">
+                      {isAr ? 'تظهر العروض النشطة فوراً في الصفحة الرئيسية للعملاء.' : 'Active deals appear immediately at top of the shop.'}
+                    </span>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={isSavingOffers}
+                    className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold cursor-pointer disabled:opacity-60"
+                  >
+                    {isSavingOffers ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                    <span>{isAr ? 'نشر العرض الآن' : 'Publish Offer'}</span>
+                  </button>
+                </div>
+              </form>
+
+              {/* Existing Offers List */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-wider">
+                  {isAr ? `العروض الحالية (${offers.length})` : `Configured Offers (${offers.length})`}
+                </h4>
+                {offers.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-xl">
+                    {isAr ? 'لم يتم إضافة عروض اليوم بعد.' : 'No offers published yet. Create your first daily deal above!'}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {offers.map((o) => {
+                      const prod = o.productId ? catalog.find((p) => p.id === o.productId) : undefined;
+                      return (
+                        <div
+                          key={o.id}
+                          className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 ${
+                            o.active ? 'bg-white border-slate-200' : 'bg-slate-50 border-slate-200 opacity-60'
+                          }`}
+                        >
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="px-2 py-0.5 rounded-md bg-rose-100 text-rose-800 text-[10px] font-black">
+                                {o.badgeText}
+                              </span>
+                              <span
+                                className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                                  o.active ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'
+                                }`}
+                              >
+                                {o.active ? (isAr ? 'نشط' : 'Active') : isAr ? 'متوقف' : 'Paused'}
+                              </span>
+                            </div>
+                            <div className="font-extrabold text-sm text-slate-900 truncate">
+                              {o.titleEn} / {o.titleAr}
+                            </div>
+                            {prod && (
+                              <div className="text-[11px] text-slate-500 font-mono truncate">
+                                Linked: {prod.name} → {o.offerPrice ? `${o.offerPrice.toFixed(3)} OMR` : `${prod.price.toFixed(3)} OMR`}
+                              </div>
+                            )}
+                            {!prod && o.categoryFilter && (
+                              <div className="text-[11px] text-slate-500">
+                                Category: {o.categoryFilter}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleOfferActive(o.id)}
+                              disabled={isSavingOffers}
+                              className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1 cursor-pointer"
+                            >
+                              {o.active ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+                              <span>{o.active ? (isAr ? 'إيقاف' : 'Pause') : isAr ? 'تشغيل' : 'Enable'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteOffer(o.id)}
+                              disabled={isSavingOffers}
+                              className="p-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* CUSTOMER INTRO VIDEO POPUP CONTROL */}
+            <div className="bg-white rounded-2xl p-5 border border-slate-200 space-y-4">
+              <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
+                <div className="w-10 h-10 rounded-xl bg-slate-900 text-emerald-400 flex items-center justify-center">
+                  <Video className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-base text-slate-900">
+                    {isAr ? 'فيديو الترحيب التلقائي للعملاء (مرة واحدة فقط)' : 'Customer Welcome Video Popup'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {isAr
+                      ? 'يفتح بالمنتصف مع الصوت لأول مرة فقط، ويُغلق تلقائياً عند انتهاء الفيديو (مع زر إغلاق). عند تغيير الرابط سيظهر مرة واحدة فقط لكل عميل.'
+                      : 'Plays centered with sound on first open before login & auto-closes when finished (with Close button). Updating the link shows it 1 time to each customer.'}
+                  </p>
+                </div>
+              </div>
+
+              <form onSubmit={(e) => handleSaveIntroVideoSetting(e)} className="space-y-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                    {isAr ? 'رابط الفيديو (YouTube أو MP4 مباشر)' : 'YouTube or MP4 Video URL'}
+                  </label>
+                  <input
+                    type="url"
+                    value={videoInput}
+                    onChange={(e) => setVideoInput(e.target.value)}
+                    placeholder="https://youtu.be/jShbHCCsW60?si=fcuFhWytTMLxSQkD"
+                    className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl font-mono focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-emerald-600/30"
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="submit"
+                    disabled={isSavingVideo}
+                    className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-extrabold cursor-pointer disabled:opacity-60"
+                  >
+                    {isSavingVideo ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                    <span>{isAr ? 'حفظ وإظهار مرة واحدة للعملاء' : 'Save & Show Once to Customers'}</span>
+                  </button>
+
+                  {videoInput.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => setShowPreviewVideo(true)}
+                      className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-bold cursor-pointer"
+                    >
+                      <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>{isAr ? 'معاينة الفيديو' : 'Preview Popup'}</span>
+                    </button>
+                  )}
+
+                  {videoInput.trim() && (
+                    <button
+                      type="button"
+                      disabled={isSavingVideo}
+                      onClick={() => handleSaveIntroVideoSetting(undefined, '')}
+                      className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold cursor-pointer"
+                    >
+                      <span>{isAr ? 'إيقاف الفيديو' : 'Disable Video'}</span>
+                    </button>
+                  )}
+                </div>
+
+                {videoStatusMsg && (
+                  <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold">
+                    {videoStatusMsg}
+                  </div>
+                )}
+              </form>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* TAB 4: SALESPLAY LIVE SYNC & STORE WHATSAPP SETTINGS */}
       {activeTab === 'salesplay' && (
         <div className="space-y-4">
@@ -2462,6 +2976,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           setCreditCustomerModal(null);
           loadAdminAnalytics(false);
         }}
+        language={language}
+      />
+
+      <IntroVideoModal
+        videoUrl={videoInput}
+        isOpen={showPreviewVideo}
+        onClose={() => setShowPreviewVideo(false)}
         language={language}
       />
     </div>

@@ -8,6 +8,7 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { AdminLoginModal } from './components/AdminLoginModal';
 import { PwaInstallPrompt } from './components/PwaInstallPrompt';
 import { FloatingWhatsAppButton } from './components/FloatingWhatsAppButton';
+import { IntroVideoModal } from './components/IntroVideoModal';
 import { PRE_TRANSLATED_PRODUCTS, CATEGORY_ARABIC_MAP } from './data/preTranslatedArabic';
 import {
   generateOrderNumber,
@@ -34,9 +35,13 @@ import {
 } from './services/adminAuthService';
 import {
   DEFAULT_WHATSAPP_NUMBER,
-  loadCachedWhatsAppNumber,
+  DEFAULT_INTRO_VIDEO_URL,
+  DEFAULT_INTRO_VIDEO_VERSION,
+  loadCachedPublicConfig,
   fetchPublicStoreConfig,
   saveWhatsAppNumberInFirestore,
+  saveIntroVideoInFirestore,
+  saveStoreOffersInFirestore,
   fetchCatalogPushMeta,
   fetchCatalogSnapshotFromFirestore,
   pushCatalogToCustomerDevices,
@@ -51,11 +56,13 @@ import type {
   InventoryItem,
   SalesPlayShop,
   CustomerProfile,
+  StoreOffer,
 } from './types';
 
 const CATALOG_CACHE_KEY = 'makarem_salesplay_catalog_v2';
 const CATALOG_VERSION_KEY = 'makarem_salesplay_catalog_version';
 const PUSH_VERSION_KEY = 'makarem_admin_push_sync_version_v1';
+const SEEN_VIDEO_VER_KEY = 'makarem_seen_intro_video_ver_v1';
 
 type AppRoute = 'shop' | 'profile' | 'admin';
 
@@ -129,10 +136,19 @@ export default function App() {
     return isEmailAuthorizedAdmin(savedEmail);
   });
 
-  // WhatsApp support number (persisted in Firestore store_settings/public_config)
-  const [whatsappNumber, setWhatsappNumber] = useState<string>(() =>
-    loadCachedWhatsAppNumber() || DEFAULT_WHATSAPP_NUMBER
+  // Store public config (WhatsApp, Intro Video popup, Today's Offers)
+  const initialPublicCfg = React.useMemo(() => loadCachedPublicConfig(), []);
+  const [whatsappNumber, setWhatsappNumber] = useState<string>(
+    () => initialPublicCfg.whatsappNumber || DEFAULT_WHATSAPP_NUMBER
   );
+  const [introVideoUrl, setIntroVideoUrl] = useState<string>(
+    () => initialPublicCfg.introVideoUrl ?? DEFAULT_INTRO_VIDEO_URL
+  );
+  const [, setIntroVideoVersion] = useState<string>(
+    () => initialPublicCfg.introVideoVersion || DEFAULT_INTRO_VIDEO_VERSION
+  );
+  const [offers, setOffers] = useState<StoreOffer[]>(() => initialPublicCfg.offers || []);
+  const [showIntroVideo, setShowIntroVideo] = useState<boolean>(false);
 
   // 58mm Thermal Auto-Print Toggle (when printer is paired in Admin Panel)
   const [autoPrintEnabled, setAutoPrintEnabled] = useState<boolean>(false);
@@ -426,7 +442,43 @@ export default function App() {
     testFirestoreConnection();
 
     fetchPublicStoreConfig()
-      .then((cfg) => setWhatsappNumber(cfg.whatsappNumber || DEFAULT_WHATSAPP_NUMBER))
+      .then((cfg) => {
+        setWhatsappNumber(cfg.whatsappNumber || DEFAULT_WHATSAPP_NUMBER);
+        setIntroVideoUrl(cfg.introVideoUrl);
+        setIntroVideoVersion(cfg.introVideoVersion);
+        setOffers(cfg.offers || []);
+
+        const hasVideo = Boolean(cfg.introVideoUrl && cfg.introVideoUrl.trim());
+        const ver = cfg.introVideoVersion || DEFAULT_INTRO_VIDEO_VERSION;
+        let seenVer = '';
+        try {
+          seenVer = localStorage.getItem(SEEN_VIDEO_VER_KEY) || '';
+        } catch {
+          seenVer = '';
+        }
+
+        const isAdminView = window.location.pathname.startsWith('/admin');
+        const hasQrDirectLogin = Boolean(getUrlCustomerIdentifier());
+        const isFirstDefaultVideo = ver === DEFAULT_INTRO_VIDEO_VERSION;
+        const alreadyLoggedIn = Boolean(loadLocalCustomerProfile());
+
+        if (hasVideo && !isAdminView && !hasQrDirectLogin && seenVer !== ver) {
+          if (isFirstDefaultVideo && alreadyLoggedIn) {
+            try {
+              localStorage.setItem(SEEN_VIDEO_VER_KEY, ver);
+            } catch {
+              // ignore storage error
+            }
+          } else {
+            setShowIntroVideo(true);
+            try {
+              localStorage.setItem(SEEN_VIDEO_VER_KEY, ver);
+            } catch {
+              // ignore storage error
+            }
+          }
+        }
+      })
       .catch(() => null);
 
     fetch('/api/salesplay/status', { cache: 'no-store' })
@@ -614,6 +666,19 @@ export default function App() {
     return saved;
   };
 
+  const handleSaveIntroVideo = async (url: string) => {
+    const saved = await saveIntroVideoInFirestore(url);
+    setIntroVideoUrl(saved.introVideoUrl);
+    setIntroVideoVersion(saved.introVideoVersion);
+    return saved;
+  };
+
+  const handleSaveOffers = async (nextOffers: StoreOffer[]) => {
+    const saved = await saveStoreOffersInFirestore(nextOffers);
+    setOffers(saved);
+    return saved;
+  };
+
   const handleConfirmOrder = async ({
     customer,
     paymentMethod,
@@ -706,6 +771,10 @@ export default function App() {
             onToggleAutoPrint={setAutoPrintEnabled}
             whatsappNumber={whatsappNumber}
             onSaveWhatsAppNumber={handleSaveWhatsAppNumber}
+            introVideoUrl={introVideoUrl}
+            onSaveIntroVideo={handleSaveIntroVideo}
+            offers={offers}
+            onSaveOffers={handleSaveOffers}
             language={language}
             salesplayShop={salesplayShop}
           />
@@ -737,6 +806,7 @@ export default function App() {
             selectedItems={selectedItems}
             onUpdateQuantity={handleUpdateQuantity}
             onOpenCart={() => setIsCartOpen(true)}
+            offers={offers}
             language={language}
           />
         )}
@@ -805,6 +875,15 @@ export default function App() {
         }}
         language={language}
       />
+
+      {currentRoute !== 'admin' && (
+        <IntroVideoModal
+          videoUrl={introVideoUrl}
+          isOpen={showIntroVideo}
+          onClose={() => setShowIntroVideo(false)}
+          language={language}
+        />
+      )}
     </div>
   );
 }

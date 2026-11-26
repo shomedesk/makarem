@@ -1,12 +1,18 @@
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { db } from '../firebase';
-import type { InventoryItem } from '../types';
+import type { InventoryItem, StoreOffer } from '../types';
 
 export const DEFAULT_WHATSAPP_NUMBER = '72095796';
-const LS_WHATSAPP_KEY = 'makarem_whatsapp_number_v1';
+export const DEFAULT_INTRO_VIDEO_URL = 'https://youtu.be/jShbHCCsW60?si=fcuFhWytTMLxSQkD';
+export const DEFAULT_INTRO_VIDEO_VERSION = 'v1_default';
+
+const LS_PUBLIC_CONFIG_KEY = 'makarem_public_config_v2';
 
 export interface PublicStoreConfig {
   whatsappNumber: string;
+  introVideoUrl: string;
+  introVideoVersion: string;
+  offers: StoreOffer[];
   updatedAt: string;
 }
 
@@ -36,37 +42,73 @@ export function formatWhatsAppUrl(rawPhone: string, message?: string): string {
   return base;
 }
 
-export function loadCachedWhatsAppNumber(): string {
+export function loadCachedPublicConfig(): PublicStoreConfig {
   try {
-    const val = localStorage.getItem(LS_WHATSAPP_KEY);
-    if (val && val.trim()) return val.trim();
+    const raw = localStorage.getItem(LS_PUBLIC_CONFIG_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        whatsappNumber: String(parsed?.whatsappNumber || DEFAULT_WHATSAPP_NUMBER),
+        introVideoUrl: String(parsed?.introVideoUrl ?? DEFAULT_INTRO_VIDEO_URL),
+        introVideoVersion: String(parsed?.introVideoVersion || DEFAULT_INTRO_VIDEO_VERSION),
+        offers: Array.isArray(parsed?.offers) ? parsed.offers : [],
+        updatedAt: String(parsed?.updatedAt || ''),
+      };
+    }
   } catch {
     // ignore storage errors
   }
-  return DEFAULT_WHATSAPP_NUMBER;
+  return {
+    whatsappNumber: DEFAULT_WHATSAPP_NUMBER,
+    introVideoUrl: DEFAULT_INTRO_VIDEO_URL,
+    introVideoVersion: DEFAULT_INTRO_VIDEO_VERSION,
+    offers: [],
+    updatedAt: '',
+  };
+}
+
+function saveCachedPublicConfig(cfg: PublicStoreConfig): void {
+  try {
+    localStorage.setItem(LS_PUBLIC_CONFIG_KEY, JSON.stringify(cfg));
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export async function fetchPublicStoreConfig(): Promise<PublicStoreConfig> {
-  const fallback = loadCachedWhatsAppNumber();
+  const fallback = loadCachedPublicConfig();
   try {
     const snap = await getDoc(doc(db, 'store_settings', 'public_config'));
     if (snap.exists()) {
       const data = snap.data();
-      const num = String(data?.whatsappNumber || '').trim() || DEFAULT_WHATSAPP_NUMBER;
-      try {
-        localStorage.setItem(LS_WHATSAPP_KEY, num);
-      } catch {
-        // ignore
+      let offers: StoreOffer[] = [];
+      if (typeof data?.offersSerialized === 'string' && data.offersSerialized.trim()) {
+        try {
+          const parsed = JSON.parse(data.offersSerialized);
+          if (Array.isArray(parsed)) offers = parsed;
+        } catch {
+          offers = [];
+        }
       }
-      return {
-        whatsappNumber: num,
+
+      const cfg: PublicStoreConfig = {
+        whatsappNumber: String(data?.whatsappNumber || '').trim() || DEFAULT_WHATSAPP_NUMBER,
+        introVideoUrl:
+          data?.introVideoUrl !== undefined
+            ? String(data.introVideoUrl || '').trim()
+            : DEFAULT_INTRO_VIDEO_URL,
+        introVideoVersion:
+          String(data?.introVideoVersion || '').trim() || DEFAULT_INTRO_VIDEO_VERSION,
+        offers,
         updatedAt: String(data?.updatedAt || ''),
       };
+      saveCachedPublicConfig(cfg);
+      return cfg;
     }
   } catch (err) {
     console.warn('Could not fetch public store config:', err);
   }
-  return { whatsappNumber: fallback, updatedAt: '' };
+  return fallback;
 }
 
 export async function saveWhatsAppNumberInFirestore(phoneInput: string): Promise<string> {
@@ -80,12 +122,51 @@ export async function saveWhatsAppNumberInFirestore(phoneInput: string): Promise
     },
     { merge: true }
   );
-  try {
-    localStorage.setItem(LS_WHATSAPP_KEY, cleaned);
-  } catch {
-    // ignore
-  }
+  const current = loadCachedPublicConfig();
+  saveCachedPublicConfig({ ...current, whatsappNumber: cleaned, updatedAt: now });
   return cleaned;
+}
+
+export async function saveIntroVideoInFirestore(videoUrlInput: string): Promise<{
+  introVideoUrl: string;
+  introVideoVersion: string;
+}> {
+  const cleaned = videoUrlInput.trim();
+  const newVersion = cleaned ? `vid_${Date.now()}` : `off_${Date.now()}`;
+  const now = new Date().toISOString();
+  await setDoc(
+    doc(db, 'store_settings', 'public_config'),
+    {
+      introVideoUrl: cleaned,
+      introVideoVersion: newVersion,
+      updatedAt: now,
+    },
+    { merge: true }
+  );
+  const current = loadCachedPublicConfig();
+  saveCachedPublicConfig({
+    ...current,
+    introVideoUrl: cleaned,
+    introVideoVersion: newVersion,
+    updatedAt: now,
+  });
+  return { introVideoUrl: cleaned, introVideoVersion: newVersion };
+}
+
+export async function saveStoreOffersInFirestore(offers: StoreOffer[]): Promise<StoreOffer[]> {
+  const now = new Date().toISOString();
+  const offersSerialized = JSON.stringify(offers);
+  await setDoc(
+    doc(db, 'store_settings', 'public_config'),
+    {
+      offersSerialized,
+      updatedAt: now,
+    },
+    { merge: true }
+  );
+  const current = loadCachedPublicConfig();
+  saveCachedPublicConfig({ ...current, offers, updatedAt: now });
+  return offers;
 }
 
 export async function fetchCatalogPushMeta(): Promise<CatalogMetaConfig | null> {
@@ -146,7 +227,7 @@ export async function pushCatalogToCustomerDevices(
   syncVersion: string
 ): Promise<void> {
   const now = new Date().toISOString();
-  // Store compact keys so 500+ items easily stay under ~100 KB (limit 1 MB)
+  // Store compact keys so 500+ items easily stay under ~120 KB (limit 1 MB)
   const compactList = items.map((p) => ({
     i: p.id,
     c: p.productCode || '',

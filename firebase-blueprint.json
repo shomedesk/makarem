@@ -146,11 +146,14 @@
     },
     "StoreSettings": {
       "title": "StoreSettings",
-      "description": "Store configuration settings, WhatsApp number, and catalog push snapshots",
+      "description": "Store configuration settings, WhatsApp number, intro video, offers, and catalog push snapshots",
       "type": "object",
       "properties": {
         "houseDeliveryEnabled": { "type": "boolean" },
         "whatsappNumber": { "type": "string", "maxLength": 30 },
+        "introVideoUrl": { "type": "string", "maxLength": 500 },
+        "introVideoVersion": { "type": "string", "maxLength": 64 },
+        "offersSerialized": { "type": "string", "maxLength": 100000 },
         "catalogSyncVersion": { "type": "string", "maxLength": 64 },
         "itemCount": { "type": "number" },
         "itemsSerialized": { "type": "string", "maxLength": 900000 },

@@ -273,3 +273,17 @@ export interface AdminInsightsResponse {
   customerStats: Record<string, AdminCustomerCreditStat>;
 }
 
+export interface StoreOffer {
+  id: string;
+  titleEn: string;
+  titleAr: string;
+  subtitleEn?: string;
+  subtitleAr?: string;
+  badgeText: string;
+  accentColor?: 'emerald' | 'amber' | 'rose' | 'slate';
+  productId?: string;
+  categoryFilter?: string;
+  offerPrice?: number;
+  active: boolean;
+  createdAt: string;
+}

@@ -219,11 +219,15 @@ service cloud.firestore {
 
     function isValidStoreSetting(data) {
       return data.keys().hasOnly([
-          'houseDeliveryEnabled', 'whatsappNumber', 'catalogSyncVersion',
+          'houseDeliveryEnabled', 'whatsappNumber', 'introVideoUrl',
+          'introVideoVersion', 'offersSerialized', 'catalogSyncVersion',
           'itemCount', 'itemsSerialized', 'updatedAt'
         ])
         && (!('houseDeliveryEnabled' in data) || data.houseDeliveryEnabled is bool)
         && (!('whatsappNumber' in data) || (data.whatsappNumber is string && data.whatsappNumber.size() <= 30))
+        && (!('introVideoUrl' in data) || (data.introVideoUrl is string && data.introVideoUrl.size() <= 500))
+        && (!('introVideoVersion' in data) || (data.introVideoVersion is string && data.introVideoVersion.size() <= 64))
+        && (!('offersSerialized' in data) || (data.offersSerialized is string && data.offersSerialized.size() <= 100000))
         && (!('catalogSyncVersion' in data) || (data.catalogSyncVersion is string && data.catalogSyncVersion.size() <= 64))
         && (!('itemCount' in data) || (data.itemCount is int && data.itemCount >= 0 && data.itemCount <= 50000))
         && (!('itemsSerialized' in data) || (data.itemsSerialized is string && data.itemsSerialized.size() <= 900000))
