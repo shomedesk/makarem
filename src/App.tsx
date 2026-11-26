@@ -27,6 +27,7 @@ import {
   clearLocalCustomerProfile,
   loginOrRegisterCustomer,
   extractCustomerIdentifier,
+  syncAllSalesPlayCustomersToFirestore,
 } from './services/customerService';
 import {
   subscribeToAdminState,
@@ -44,6 +45,7 @@ import {
   saveStoreOffersInFirestore,
   fetchCatalogPushMeta,
   fetchCatalogSnapshotFromFirestore,
+  fetchBundledCatalogSeed,
   pushCatalogToCustomerDevices,
 } from './services/storeConfigService';
 import { testFirestoreConnection } from './firebase';
@@ -358,12 +360,26 @@ export default function App() {
       };
 
       try {
+        // Hydrate immediately from bundled seed on cold launch if cache is empty so store never flashes blank
+        let seedItems: InventoryItem[] = [];
+        if (loadCachedCatalog().length === 0) {
+          fetchBundledCatalogSeed()
+            .then((seeded) => {
+              if (seeded.length > 0) {
+                seedItems = seeded;
+                setRawSalesPlayItems((prev) => (prev.length === 0 ? seeded : prev));
+                setIsLoadingCatalog(false);
+              }
+            })
+            .catch(() => null);
+        }
+
         const backendProducts = await tryBackendFetch(0);
         if (backendProducts && backendProducts.length > 0) {
           return backendProducts;
         }
 
-        // Resilience fallback: load compact catalog snapshot stored in Firestore (e.g. if API unavailable on static launch)
+        // Resilience fallback 1: compact catalog snapshot stored in Firestore
         const snapshot = await fetchCatalogSnapshotFromFirestore();
         if (snapshot && snapshot.products.length > 0) {
           setRawSalesPlayItems(snapshot.products);
@@ -376,6 +392,18 @@ export default function App() {
             // ignore storage errors
           }
           return snapshot.products;
+        }
+
+        // Resilience fallback 2: static /catalog-seed.json bundled with the build
+        const bundled = seedItems.length > 0 ? seedItems : await fetchBundledCatalogSeed();
+        if (bundled.length > 0) {
+          setRawSalesPlayItems(bundled);
+          try {
+            localStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify(bundled));
+          } catch {
+            // ignore storage errors
+          }
+          return bundled;
         }
         return [];
       } finally {
@@ -424,7 +452,10 @@ export default function App() {
     if (itemsToCheck.length > 0) {
       const newPushVersion = String(Date.now());
       try {
-        await pushCatalogToCustomerDevices(itemsToCheck, newPushVersion);
+        await Promise.all([
+          pushCatalogToCustomerDevices(itemsToCheck, newPushVersion),
+          syncAllSalesPlayCustomersToFirestore().catch(() => null),
+        ]);
         localStorage.setItem(PUSH_VERSION_KEY, newPushVersion);
         pushedToDevices = true;
       } catch (err) {
@@ -532,13 +563,33 @@ export default function App() {
     bootstrapCatalogSmartly();
   }, [fetchSalesPlayProducts]);
 
-  // Real-time orders listener (Admin only) + Sound Chime + 58mm Auto-Print
+  // Real-time orders listener (Admin only) + Sound Chime + 58mm Auto-Print + auto-bootstrap Firestore snapshot if empty
   useEffect(() => {
     if (!isAdminLoggedIn) {
       setOrders([]);
       knownOrderIdsRef.current = null;
       return;
     }
+
+    // Ensure Firestore catalog_snapshot & POS customer profiles exist for offline/static launches
+    fetchCatalogPushMeta()
+      .then(async (meta) => {
+        if (!meta) {
+          const items =
+            rawSalesPlayItems.length > 0 ? rawSalesPlayItems : await fetchSalesPlayProducts(false, false);
+          if (items.length > 0) {
+            const ver = String(Date.now());
+            await pushCatalogToCustomerDevices(items, ver).catch(() => null);
+            try {
+              localStorage.setItem(PUSH_VERSION_KEY, ver);
+            } catch {
+              // ignore
+            }
+          }
+          await syncAllSalesPlayCustomersToFirestore().catch(() => null);
+        }
+      })
+      .catch(() => null);
     const unsubscribe = subscribeToOrders((newOrders) => {
       setOrders(newOrders);
 

@@ -184,6 +184,23 @@ export async function fetchCatalogPushMeta(): Promise<CatalogMetaConfig | null> 
   }
 }
 
+function parseCompactCatalogItems(parsed: any[]): InventoryItem[] {
+  return parsed.map((p: any) => ({
+    id: String(p.i || p.id || ''),
+    productCode: String(p.c || p.productCode || ''),
+    name: String(p.n || p.name || ''),
+    arabicName: String(p.an || p.arabicName || ''),
+    category: String(p.g || p.category || 'Uncategorized'),
+    price: Number(p.p ?? p.price ?? 0),
+    stock: Number(p.s ?? p.stock ?? 0),
+    stockControl: Boolean(p.sc ?? p.stockControl),
+    unit: String(p.u || p.unit || 'pcs'),
+    barcode: String(p.b || p.barcode || ''),
+    salesplayItemId: String(p.i || p.id || ''),
+    imageUrl: String(p.m || p.imageUrl || ''),
+  }));
+}
+
 export async function fetchCatalogSnapshotFromFirestore(): Promise<{
   catalogSyncVersion: string;
   products: InventoryItem[];
@@ -197,28 +214,26 @@ export async function fetchCatalogSnapshotFromFirestore(): Promise<{
     const parsed = JSON.parse(rawStr);
     if (!Array.isArray(parsed)) return null;
 
-    const products: InventoryItem[] = parsed.map((p: any) => ({
-      id: String(p.i || p.id || ''),
-      productCode: String(p.c || p.productCode || ''),
-      name: String(p.n || p.name || ''),
-      arabicName: String(p.an || p.arabicName || ''),
-      category: String(p.g || p.category || 'Uncategorized'),
-      price: Number(p.p ?? p.price ?? 0),
-      stock: Number(p.s ?? p.stock ?? 0),
-      stockControl: Boolean(p.sc ?? p.stockControl),
-      unit: String(p.u || p.unit || 'pcs'),
-      barcode: String(p.b || p.barcode || ''),
-      salesplayItemId: String(p.i || p.id || ''),
-      imageUrl: String(p.m || p.imageUrl || ''),
-    }));
-
     return {
       catalogSyncVersion: String(data?.catalogSyncVersion || data?.updatedAt || ''),
-      products,
+      products: parseCompactCatalogItems(parsed),
     };
   } catch (err) {
     console.warn('Failed to parse catalog snapshot:', err);
     return null;
+  }
+}
+
+export async function fetchBundledCatalogSeed(): Promise<InventoryItem[]> {
+  try {
+    const res = await fetch('/catalog-seed.json', { cache: 'no-store' });
+    if (!res.ok) return [];
+    const parsed = await res.json();
+    if (!Array.isArray(parsed)) return [];
+    return parseCompactCatalogItems(parsed);
+  } catch (err) {
+    console.warn('Failed to load bundled catalog seed:', err);
+    return [];
   }
 }
 

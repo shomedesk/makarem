@@ -17,6 +17,15 @@ function salesPlayApiPlugin(): Plugin {
         next();
       });
     },
+    configurePreviewServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        if (req.url?.startsWith('/api/salesplay')) {
+          const handled = await handleSalesPlayRequest(req, res);
+          if (handled) return;
+        }
+        next();
+      });
+    },
   };
 }
 
@@ -49,7 +58,7 @@ export default defineConfig(() => {
         devOptions: {
           enabled: false,
         },
-        includeAssets: ['favicon.png', 'apple-touch-icon.png', 'icon.svg', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
+        includeAssets: ['favicon.png', 'apple-touch-icon.png', 'icon.svg', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png', 'catalog-seed.json'],
         manifest: {
           id: '/',
           name: 'Makarem Al-Khair Modern Grocery',
