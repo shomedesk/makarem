@@ -465,6 +465,13 @@ async function ensureReceiptsSynced(
   return receiptIndex.inFlight;
 }
 
+export function warmupSalesPlayCache(): void {
+  // Non-blocking background pre-warm so customer-profile & catalog endpoints answer in ~10ms
+  setTimeout(() => {
+    Promise.allSettled([getCustomersCached(false), ensureReceiptsSynced(false)]).catch(() => null);
+  }, 500);
+}
+
 export async function handleSalesPlayRequest(
   req: IncomingMessage,
   res: ServerResponse

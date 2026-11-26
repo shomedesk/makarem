@@ -151,6 +151,27 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
           postMerge.mergedReceipts,
           postMerge.lastFinalizedAt
         );
+      } else if (!forcePosRefresh && preMerge.mergedReceipts.length === 0) {
+        // Retry once after 2s in case server was warming POS receipt index
+        setTimeout(async () => {
+          const retryData = await fetchSalesPlayCustomerProfile(cust.phone, cust.customerCode, {
+            full: true,
+          });
+          if (retryData?.matched) {
+            setPosProfile(retryData);
+            const retryMerge = mergeArchivedAndDeltaReceipts({
+              ledgerDoc,
+              localArchive,
+              deltaReceipts: retryData.receipts || [],
+            });
+            setMergedReceipts(retryMerge.mergedReceipts);
+            saveLocalBillArchive(
+              retryData.customer?.customerCode || cust.customerCode,
+              retryMerge.mergedReceipts,
+              retryMerge.lastFinalizedAt
+            );
+          }
+        }, 2000);
       }
     } catch (err) {
       console.warn('Error loading customer profile dashboard:', err);

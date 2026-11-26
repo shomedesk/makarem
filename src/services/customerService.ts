@@ -110,7 +110,7 @@ export async function fetchSalesPlayCustomerProfile(
   options?: CustomerProfileFetchOptions
 ): Promise<SalesPlayCustomerProfileResponse | null> {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 8000);
+  const timeoutId = window.setTimeout(() => controller.abort(), 25000);
   try {
     const params = new URLSearchParams();
     if (phone) params.set('phone', phone);
@@ -125,7 +125,8 @@ export async function fetchSalesPlayCustomerProfile(
       cache: 'no-store',
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (!res.ok || !ct.includes('application/json')) return null;
     return (await res.json()) as SalesPlayCustomerProfileResponse;
   } catch (err) {
     console.warn('SalesPlay customer profile fetch failed:', err);
@@ -139,7 +140,8 @@ async function fetchSalesPlayUsedCodes(): Promise<Set<string>> {
   const used = new Set<string>();
   try {
     const res = await fetch('/api/salesplay/customers', { cache: 'no-store' });
-    if (res.ok) {
+    const ct = res.headers.get('content-type') || '';
+    if (res.ok && ct.includes('application/json')) {
       const data = await res.json();
       for (const c of data.customers || []) {
         if (c.customerCode) {
@@ -192,7 +194,11 @@ export async function loginOrRegisterCustomer(
     // 2. Fallback: Check SalesPlay POS by customerCode -> create/link Firestore profile cleanly
     const spMatch = await fetchSalesPlayCustomerProfile(undefined, paddedCode);
     if (spMatch?.matched && spMatch.customer) {
-      const linked = await upsertSalesPlayMatchedCustomer(spMatch.customer, '');
+      const linked = await upsertSalesPlayMatchedCustomer(
+        spMatch.customer,
+        '',
+        spMatch.creditSummary?.creditLimit ?? null
+      );
       saveLocalCustomerProfile(linked);
       return linked;
     }
@@ -243,7 +249,11 @@ export async function loginOrRegisterCustomer(
   // 2. Check if customer ALREADY exists in SalesPlay POS by Mobile Number (prevent duplicate!)
   const spMatch = await fetchSalesPlayCustomerProfile(raw, undefined);
   if (spMatch?.matched && spMatch.customer) {
-    const linked = await upsertSalesPlayMatchedCustomer(spMatch.customer, raw);
+    const linked = await upsertSalesPlayMatchedCustomer(
+      spMatch.customer,
+      raw,
+      spMatch.creditSummary?.creditLimit ?? null
+    );
     saveLocalCustomerProfile(linked);
     return linked;
   }
@@ -268,7 +278,8 @@ export async function loginOrRegisterCustomer(
  */
 async function upsertSalesPlayMatchedCustomer(
   spCustomer: NonNullable<SalesPlayCustomerProfileResponse['customer']>,
-  fallbackPhone: string
+  fallbackPhone: string,
+  creditLimit: number | null = null
 ): Promise<CustomerProfile> {
   const now = new Date().toISOString();
   const code = String(spCustomer.customerCode || '').trim() || '001';
@@ -289,6 +300,14 @@ async function upsertSalesPlayMatchedCustomer(
       phoneNormalized: phoneNormalized || data.phoneNormalized || '',
       ...(spCustomer.name || data.name ? { name: spCustomer.name || data.name } : {}),
       salesplayCustomerId: spCustomer.id,
+      ...(creditLimit !== null && creditLimit !== undefined
+        ? { creditLimit }
+        : data.creditLimit !== undefined
+        ? { creditLimit: data.creditLimit }
+        : {}),
+      ...(spCustomer.totalVisits !== undefined ? { totalVisits: spCustomer.totalVisits } : {}),
+      ...(spCustomer.totalSpent !== undefined ? { totalSpent: spCustomer.totalSpent } : {}),
+      ...(spCustomer.firstVisit ? { firstVisit: spCustomer.firstVisit } : {}),
       createdAt: data.createdAt || now,
       updatedAt: now,
     };
@@ -308,6 +327,10 @@ async function upsertSalesPlayMatchedCustomer(
     phoneNormalized,
     ...(spCustomer.name ? { name: spCustomer.name } : {}),
     salesplayCustomerId: spCustomer.id,
+    ...(creditLimit !== null && creditLimit !== undefined ? { creditLimit } : {}),
+    ...(spCustomer.totalVisits !== undefined ? { totalVisits: spCustomer.totalVisits } : {}),
+    ...(spCustomer.totalSpent !== undefined ? { totalSpent: spCustomer.totalSpent } : {}),
+    ...(spCustomer.firstVisit ? { firstVisit: spCustomer.firstVisit } : {}),
     createdAt: existingCreatedAt || now,
     updatedAt: now,
   };
@@ -416,7 +439,10 @@ export async function fetchAllCustomersForAdmin(): Promise<AdminCustomerRecord[]
   const [fsSnap, spRes] = await Promise.all([
     getDocs(collection(db, 'customers')),
     fetch('/api/salesplay/customers', { cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : { customers: [] }))
+      .then(async (r) => {
+        const ct = r.headers.get('content-type') || '';
+        return r.ok && ct.includes('application/json') ? r.json() : { customers: [] };
+      })
       .catch(() => ({ customers: [] })),
   ]);
 
