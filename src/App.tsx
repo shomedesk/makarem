@@ -138,6 +138,7 @@ export default function App() {
     return isEmailAuthorizedAdmin(savedEmail);
   });
   const [isAdminAuthConfirmed, setIsAdminAuthConfirmed] = useState<boolean>(false);
+  const [isAdminEmailVerified, setIsAdminEmailVerified] = useState<boolean>(true);
 
   // Store public config (WhatsApp, Intro Video popup, Today's Offers)
   const initialPublicCfg = React.useMemo(() => loadCachedPublicConfig(), []);
@@ -249,6 +250,7 @@ export default function App() {
     const unsub = subscribeToAdminState((isAdmin, user) => {
       setIsAdminLoggedIn(isAdmin);
       setIsAdminAuthConfirmed(Boolean(isAdmin && user));
+      setIsAdminEmailVerified(Boolean(user?.emailVerified));
       if (!isAdmin && currentRoute === 'admin') {
         setCurrentRoute('shop');
       }
@@ -415,7 +417,7 @@ export default function App() {
     []
   );
 
-  // Admin "Sync to Customer Devices": refreshes SalesPlay POS + translates new items + pushes snapshot/version to all customer devices
+  // Admin "Sync to Customer Devices": refreshes SalesPlay POS + translates new items + pushes snapshot/version + customer ledgers
   const handleSyncToCustomerDevices = useCallback(async () => {
     const [freshItems, freshFs] = await Promise.all([
       fetchSalesPlayProducts(true, true),
@@ -449,36 +451,62 @@ export default function App() {
       }
     }
 
-    // Push single compact snapshot + bump push version in store_settings/catalog_meta + sync customer ledgers
     let pushedToDevices = false;
     let customersSynced = 0;
     let ledgersSynced = 0;
+    let ledgersWritten = 0;
+    let failedLedgers = 0;
     let posConnected: boolean | undefined = undefined;
+    let requiresAuth = false;
+    let requiresVerifiedEmail = false;
+    let syncError: string | undefined;
 
-    if (itemsToCheck.length > 0) {
-      const newPushVersion = String(Date.now());
-      try {
-        const [, custSync] = await Promise.all([
-          pushCatalogToCustomerDevices(itemsToCheck, newPushVersion),
-          syncAllSalesPlayCustomersToFirestore({ syncLedgers: true }).catch(() => null),
-        ]);
-        localStorage.setItem(PUSH_VERSION_KEY, newPushVersion);
-        pushedToDevices = true;
-        if (custSync) {
-          customersSynced = custSync.customersSynced;
-          ledgersSynced = custSync.ledgersTotal;
-          posConnected = custSync.posConnected;
-          if (custSync.posConnected && custSync.ledgersTotal > 0) {
-            try {
-              localStorage.setItem('makarem_cust_ledger_sync_v3', '1');
-            } catch {
-              // ignore
-            }
-          }
+    const newPushVersion = String(Date.now());
+    const [catalogPushResult, custSyncResult] = await Promise.allSettled([
+      itemsToCheck.length > 0
+        ? pushCatalogToCustomerDevices(itemsToCheck, newPushVersion)
+        : Promise.resolve(),
+      syncAllSalesPlayCustomersToFirestore({ syncLedgers: true }),
+    ]);
+
+    if (catalogPushResult.status === 'fulfilled') {
+      if (itemsToCheck.length > 0) {
+        try {
+          localStorage.setItem(PUSH_VERSION_KEY, newPushVersion);
+        } catch {
+          // ignore
         }
-      } catch (err) {
-        console.warn('Could not push catalog snapshot to customer devices:', err);
+        pushedToDevices = true;
       }
+    } else {
+      const errMsg = catalogPushResult.reason?.message || 'Could not push catalog to Firestore';
+      syncError = errMsg;
+      console.warn('Catalog push failed:', catalogPushResult.reason);
+    }
+
+    if (custSyncResult.status === 'fulfilled') {
+      const custSync = custSyncResult.value;
+      customersSynced = custSync.customersSynced;
+      ledgersSynced = custSync.ledgersTotal;
+      ledgersWritten = custSync.ledgersWritten;
+      failedLedgers = custSync.failedLedgers;
+      posConnected = custSync.posConnected;
+      requiresAuth = Boolean(custSync.requiresAuth);
+      requiresVerifiedEmail = Boolean(custSync.requiresVerifiedEmail);
+      if (custSync.errors && custSync.errors.length > 0) {
+        syncError = custSync.errors[0];
+      }
+      if (custSync.posConnected && custSync.ledgersTotal > 0) {
+        try {
+          localStorage.setItem('makarem_cust_ledger_sync_v3', '1');
+        } catch {
+          // ignore
+        }
+      }
+    } else {
+      const errMsg = custSyncResult.reason?.message || 'Customer ledger sync failed';
+      syncError = syncError ? `${syncError}; ${errMsg}` : errMsg;
+      console.warn('Customer sync failed:', custSyncResult.reason);
     }
 
     return {
@@ -488,7 +516,12 @@ export default function App() {
       pushedToDevices,
       customersSynced,
       ledgersSynced,
+      ledgersWritten,
+      failedLedgers,
       posConnected,
+      requiresAuth,
+      requiresVerifiedEmail,
+      syncError,
     };
   }, [fetchSalesPlayProducts, rawSalesPlayItems]);
 
@@ -869,6 +902,9 @@ export default function App() {
             onSaveOffers={handleSaveOffers}
             language={language}
             salesplayShop={salesplayShop}
+            isFirebaseAdminSignedIn={isAdminAuthConfirmed}
+            isAdminEmailVerified={isAdminEmailVerified}
+            onReauthenticateAdmin={() => setShowAdminLoginModal(true)}
           />
         ) : currentRoute === 'profile' ? (
           <CustomerProfilePage

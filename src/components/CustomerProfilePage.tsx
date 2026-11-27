@@ -104,21 +104,17 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
         loadLocalBillArchive(cust.customerCode) ||
         (paddedCode !== cust.customerCode ? loadLocalBillArchive(paddedCode) : null);
 
-      if (localArchive?.receipts?.length) {
-        setMergedReceipts(localArchive.receipts);
-      }
-
       const [refreshedFsProfile, ordersList, primaryLedger, initialSettlements] =
         await Promise.all([
-          refreshCustomerProfileFromFirestore(cust),
+          refreshCustomerProfileFromFirestore(cust, true),
           fetchCustomerOrders(cust.phone, cust.customerCode),
-          fetchCustomerLedgerDoc(cust.customerCode),
+          fetchCustomerLedgerDoc(cust.customerCode, true),
           fetchCustomerSettlements(cust.customerCode),
         ]);
 
       let ledgerDoc = primaryLedger;
       if (!ledgerDoc && paddedCode && paddedCode !== cust.customerCode) {
-        ledgerDoc = await fetchCustomerLedgerDoc(paddedCode);
+        ledgerDoc = await fetchCustomerLedgerDoc(paddedCode, true);
       }
 
       const activeCust = refreshedFsProfile || cust;
@@ -130,14 +126,19 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
       setLedgerMeta(ledgerDoc);
       setSettlements(initialSettlements);
 
+      // When Firestore ledger exists, treat it as authoritative pre-POS truth so deleted/edited
+      // bills in localStorage never override cloud snapshots; only fall back to raw localArchive if ledgerDoc is null.
       const preMerge = mergeArchivedAndDeltaReceipts({
         ledgerDoc,
         localArchive,
         deltaReceipts: [],
+        authoritativeCloudSnapshot: Boolean(ledgerDoc),
       });
 
-      if (preMerge.mergedReceipts.length > 0) {
+      if (ledgerDoc || preMerge.mergedReceipts.length > 0) {
         setMergedReceipts(preMerge.mergedReceipts);
+      } else if (localArchive?.receipts?.length) {
+        setMergedReceipts(localArchive.receipts);
       }
 
       const spData = await fetchSalesPlayCustomerProfile(activeCust.phone, activeCust.customerCode, {
@@ -156,7 +157,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
         let canonicalLocal = localArchive;
         if (canonicalCode && canonicalCode !== activeCust.customerCode) {
           const [extraLedger, extraSettlements] = await Promise.all([
-            fetchCustomerLedgerDoc(canonicalCode),
+            fetchCustomerLedgerDoc(canonicalCode, true),
             fetchCustomerSettlements(canonicalCode),
           ]);
           canonicalLedger = extraLedger || ledgerDoc;
@@ -181,37 +182,49 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
           postMerge.mergedReceipts,
           postMerge.lastFinalizedAt
         );
-      } else if (!ledgerDoc && preMerge.mergedReceipts.length === 0) {
-        if (!forcePosRefresh) {
-          // Retry once after 2s in case POS server was warming receipt index
-          setTimeout(async () => {
-            const retryData = await fetchSalesPlayCustomerProfile(
-              activeCust.phone,
-              activeCust.customerCode,
-              { full: true }
-            );
-            if (retryData?.matched) {
-              setPosProfile(retryData);
-              setIsPosSyncPending(false);
-              const retryMerge = mergeArchivedAndDeltaReceipts({
-                ledgerDoc,
-                localArchive,
-                deltaReceipts: retryData.receipts || [],
-                activeReceiptNumbers: retryData.activeReceiptNumbers,
-                windowStartDate: retryData.windowStartDate,
-              });
-              setMergedReceipts(retryMerge.mergedReceipts);
-              saveLocalBillArchive(
-                retryData.customer?.customerCode || activeCust.customerCode,
-                retryMerge.mergedReceipts,
-                retryMerge.lastFinalizedAt
+      } else {
+        setPosProfile(null);
+        if (ledgerDoc) {
+          // Launched static host (POS backend not present): overwrite localStorage with latest cloud snapshot
+          const cloudCode = ledgerDoc.customerCode || paddedCode || activeCust.customerCode;
+          setMergedReceipts(preMerge.mergedReceipts);
+          saveLocalBillArchive(
+            cloudCode,
+            preMerge.mergedReceipts,
+            preMerge.lastFinalizedAt
+          );
+        } else if (preMerge.mergedReceipts.length === 0) {
+          if (!forcePosRefresh) {
+            // Retry once after 2s in case POS server was warming receipt index
+            setTimeout(async () => {
+              const retryData = await fetchSalesPlayCustomerProfile(
+                activeCust.phone,
+                activeCust.customerCode,
+                { full: true }
               );
-            } else {
-              setIsPosSyncPending(true);
-            }
-          }, 2000);
-        } else {
-          setIsPosSyncPending(true);
+              if (retryData?.matched) {
+                setPosProfile(retryData);
+                setIsPosSyncPending(false);
+                const retryMerge = mergeArchivedAndDeltaReceipts({
+                  ledgerDoc,
+                  localArchive,
+                  deltaReceipts: retryData.receipts || [],
+                  activeReceiptNumbers: retryData.activeReceiptNumbers,
+                  windowStartDate: retryData.windowStartDate,
+                });
+                setMergedReceipts(retryMerge.mergedReceipts);
+                saveLocalBillArchive(
+                  retryData.customer?.customerCode || activeCust.customerCode,
+                  retryMerge.mergedReceipts,
+                  retryMerge.lastFinalizedAt
+                );
+              } else {
+                setIsPosSyncPending(true);
+              }
+            }, 2000);
+          } else {
+            setIsPosSyncPending(true);
+          }
         }
       }
     } catch (err) {
@@ -223,11 +236,11 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
 
   useEffect(() => {
     setVisibleBillCount(BILLS_PAGE_SIZE);
+    setPosProfile(null);
     if (profile) {
       loadFullDashboard(profile, false);
     } else {
       setAppOrders([]);
-      setPosProfile(null);
       setLedgerMeta(null);
       setMergedReceipts([]);
       setSettlements([]);
@@ -273,10 +286,12 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
       // When running in Firestore snapshot mode (POS backend not active on host),
       // treat updated customer_ledgers as authoritative so deleted bills also disappear from local cache
       if (!posProfile?.matched) {
+        const currentLocal = loadLocalBillArchive(effectiveCustomerCode);
         const snapshotMerge = mergeArchivedAndDeltaReceipts({
           ledgerDoc: nextLedger,
-          localArchive: null,
+          localArchive: currentLocal,
           deltaReceipts: [],
+          authoritativeCloudSnapshot: true,
         });
         setMergedReceipts(snapshotMerge.mergedReceipts);
         saveLocalBillArchive(
@@ -603,7 +618,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
       {/* Purchase History Section with Separate Due Bills & Settlement Status */}
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
         <div className="px-5 pt-4 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/70">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
               onClick={() => setActiveTab('receipts')}
@@ -631,6 +646,18 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
                 ? `الطلبات الإلكترونية (${appOrders.length})`
                 : `Online Orders (${appOrders.length})`}
             </button>
+
+            {posProfile?.matched ? (
+              <span className="mb-2.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-600" />
+                {isAr ? 'مباشر من الكاشير' : 'Live POS'}
+              </span>
+            ) : ledgerMeta?.updatedAt ? (
+              <span className="mb-2.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 text-[10px] font-mono">
+                {isAr ? 'آخر تحديث سحابي:' : 'Cloud synced:'}{' '}
+                {new Date(ledgerMeta.updatedAt).toLocaleString()}
+              </span>
+            ) : null}
           </div>
 
           {activeTab === 'receipts' && enrichedSummary.bills.length > 0 && (

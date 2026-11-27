@@ -92,7 +92,12 @@ interface AdminDashboardProps {
     pushedToDevices?: boolean;
     customersSynced?: number;
     ledgersSynced?: number;
+    ledgersWritten?: number;
+    failedLedgers?: number;
     posConnected?: boolean;
+    requiresAuth?: boolean;
+    requiresVerifiedEmail?: boolean;
+    syncError?: string;
   }>;
   onUpdateProductImage?: (productId: string, imageUrl: string) => void;
   autoPrintEnabled: boolean;
@@ -108,6 +113,9 @@ interface AdminDashboardProps {
   onSaveOffers: (offers: StoreOffer[]) => Promise<StoreOffer[]>;
   language: 'en' | 'ar';
   salesplayShop: SalesPlayShop | null;
+  isFirebaseAdminSignedIn?: boolean;
+  isAdminEmailVerified?: boolean;
+  onReauthenticateAdmin?: () => void;
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
@@ -125,6 +133,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onSaveOffers,
   language,
   salesplayShop,
+  isFirebaseAdminSignedIn = true,
+  isAdminEmailVerified = true,
+  onReauthenticateAdmin,
 }) => {
   const isAr = language === 'ar';
   const [filterStatus, setFilterStatus] = useState<string>('all');
@@ -150,6 +161,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Refresh & Translate Catalog state
   const [isRefreshingSync, setIsRefreshingSync] = useState(false);
   const [syncBannerMsg, setSyncBannerMsg] = useState<string | null>(null);
+  const [syncBannerTone, setSyncBannerTone] = useState<'success' | 'warning' | 'error'>('success');
   const [autoPosCloudSync, setAutoPosCloudSync] = useState<boolean>(() => {
     try {
       return localStorage.getItem('makarem_auto_pos_cloud_sync_v1') === '1';
@@ -302,14 +314,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         if (cancelled) return;
         if (!res.posConnected) {
           setAutoPosCloudSync(false);
+          setSyncBannerTone('warning');
           setSyncBannerMsg(
             isAr
               ? 'المزامنة التلقائية متاحة فقط من رابط التطوير (Dev) أو الخادم المتصل بالكاشير.'
-              : 'Auto-Sync requires the POS backend (open Dev Admin on your counter PC/tablet).'
+              : 'Auto-Sync requires the POS backend (open Dev Admin on your counter PC/tablet to push live SalesPlay bills).'
+          );
+          return;
+        }
+        if (res.requiresAuth || res.requiresVerifiedEmail) {
+          setAutoPosCloudSync(false);
+          setSyncBannerTone('error');
+          setSyncBannerMsg(
+            isAr
+              ? 'تعذر حفظ فواتير العملاء: يرجى تسجيل الدخول بحساب Google المعتمد للإدارة.'
+              : 'Auto-Sync blocked: Please sign in with your verified Admin Google Account to write customer bill ledgers.'
+          );
+          return;
+        }
+        if (res.failedLedgers > 0 || (res.errors && res.errors.length > 0)) {
+          setSyncBannerTone('error');
+          setSyncBannerMsg(
+            `Auto-Sync error (${res.failedLedgers} failed): ${res.errors?.[0] || 'Check Firestore permissions'}`
           );
           return;
         }
         if (res.ledgersWritten > 0 || res.customersSynced > 0) {
+          setSyncBannerTone('success');
           setSyncBannerMsg(
             isAr
               ? `مزامنة تلقائية: تم تحديث ${res.ledgersWritten} سجل عميل جديد/محذوف على الأجهزة المنشورة.`
@@ -317,8 +348,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           );
           loadCustomersDirectory();
         }
-      } catch {
-        // non-fatal
+      } catch (err: any) {
+        if (!cancelled) {
+          setSyncBannerTone('error');
+          setSyncBannerMsg(`Auto-Sync error: ${err?.message || 'Unknown error'}`);
+        }
       } finally {
         if (!cancelled) setIsAutoSyncTicking(false);
       }
@@ -549,15 +583,44 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setSyncBannerMsg(null);
     try {
       const res = await onRefreshAndTranslateCatalog();
+
+      if (res.requiresAuth || res.requiresVerifiedEmail) {
+        setSyncBannerTone('error');
+        setSyncBannerMsg(
+          isAr
+            ? 'تعذر حفظ فواتير العملاء في السحابة: يرجى تسجيل الدخول بحساب Google المعتمد للإدارة.'
+            : 'Customer bills NOT synced: Please re-sign in using your verified Admin Google Account (Firestore rules require verified email).'
+        );
+        return;
+      }
+
+      if (res.syncError || (res.failedLedgers && res.failedLedgers > 0)) {
+        setSyncBannerTone('error');
+        setSyncBannerMsg(
+          isAr
+            ? `خطأ في المزامنة (${res.failedLedgers || 1} فشل): ${res.syncError || 'فشل الحفظ'}`
+            : `Sync error (${res.failedLedgers || 0} failed ledger(s)): ${res.syncError || 'Write failed'}`
+        );
+        return;
+      }
+
+      if (res.posConnected === false) {
+        setSyncBannerTone('warning');
+        setSyncBannerMsg(
+          isAr
+            ? 'تنبيه: هذا الرابط لا يتصل مباشرة بجهاز POS — تم تحديث الأصناف فقط. لمزامنة فواتير العملاء افتح لوحة الإدارة من رابط التطوير (Dev).'
+            : 'POS backend is offline on this launched URL — customer POS bills were NOT updated. Open Dev Admin to push new/deleted SalesPlay bills to Firestore.'
+        );
+        await loadCustomersDirectory();
+        return;
+      }
+
+      setSyncBannerTone('success');
       const ledgerPart =
         typeof res.ledgersSynced === 'number' && res.ledgersSynced > 0
           ? isAr
-            ? ` + ${res.customersSynced || res.ledgersSynced} عميل و${res.ledgersSynced} سجل فواتير`
-            : ` + ${res.customersSynced || res.ledgersSynced} customers & ${res.ledgersSynced} bill ledgers`
-          : res.posConnected === false
-          ? isAr
-            ? ' (تنبيه: سجلات POS تحتاج المزامنة من بيئة التطوير)'
-            : ' (Note: POS customer ledgers require syncing from Dev Admin)'
+            ? ` + ${res.customersSynced || res.ledgersSynced} عميل و${res.ledgersSynced} سجل فواتير (${res.ledgersWritten ?? 0} محدّث)`
+            : ` + ${res.customersSynced || res.ledgersSynced} customers & ${res.ledgersSynced} bill ledgers (${res.ledgersWritten ?? 0} updated)`
           : '';
 
       const pushNote = res.pushedToDevices
@@ -820,25 +883,34 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const res = await syncAllSalesPlayCustomersToFirestore({ syncLedgers: true });
       await loadCustomersDirectory();
       if (!res.posConnected) {
-        setClearNotice(
+        setSyncBannerTone('warning');
+        setSyncBannerMsg(
           isAr
-            ? 'تعذر الاتصال بخادم POS من هذا الرابط. يرجى الضغط على "مزامنة" من لوحة التحكم في رابط التطوير (Dev).'
-            : 'POS backend is not connected on this host. Run Sync from your Dev Admin panel to push customer bills to Firestore.'
+            ? 'تعذر الاتصال بخادم POS من هذا الرابط المنشور. يرجى الضغط على "مزامنة" من لوحة التحكم في رابط التطوير (Dev).'
+            : 'POS backend is not reachable on this launched URL. Open Dev Admin to push customer bills to Firestore.'
         );
-      } else if (res.requiresAuth) {
-        setClearNotice(
+      } else if (res.requiresAuth || res.requiresVerifiedEmail) {
+        setSyncBannerTone('error');
+        setSyncBannerMsg(
           isAr
-            ? `تم حفظ ${res.customersSynced} عميل — يرجى تسجيل الدخول بحساب الإدارة لحفظ سجلات الفواتير.`
-            : `Saved ${res.customersSynced} customer profiles — please re-sign in as Admin to write bill ledgers.`
+            ? `تم حفظ ${res.customersSynced} عميل — يرجى تسجيل الدخول بحساب Google المعتمد لحفظ سجلات الفواتير.`
+            : `Saved ${res.customersSynced} profiles — please re-sign in with verified Admin Google Account to write bill ledgers.`
+        );
+      } else if (res.failedLedgers > 0 || (res.errors && res.errors.length > 0)) {
+        setSyncBannerTone('error');
+        setSyncBannerMsg(
+          `Synced ${res.customersSynced} customers, but ${res.failedLedgers} ledger(s) failed: ${
+            res.errors?.[0] || 'Firestore error'
+          }`
         );
       } else {
-        setClearNotice(
+        setSyncBannerTone('success');
+        setSyncBannerMsg(
           isAr
             ? `تمت مزامنة ${res.customersSynced} عميل و ${res.ledgersTotal} سجل فواتير (${res.ledgersWritten} محدّث) إلى Firestore للعمل على الموقع المنشور.`
             : `Synced ${res.customersSynced} customers & ${res.ledgersTotal} bill ledgers (${res.ledgersWritten} updated) to Firestore for launched devices.`
         );
       }
-      setTimeout(() => setClearNotice(null), 6000);
     } finally {
       setIsSyncingCustomers(false);
     }
@@ -1309,13 +1381,44 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       </div>
 
+      {(!isFirebaseAdminSignedIn || !isAdminEmailVerified) && (
+        <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-300 text-rose-900 text-xs font-bold flex flex-wrap items-center justify-between gap-2">
+          <span>
+            {!isFirebaseAdminSignedIn
+              ? isAr
+                ? 'تنبيه: جلسة الإدارة في Firebase غير نشطة — لن يتم حفظ فواتير العملاء في السحابة حتى تسجيل الدخول.'
+                : 'Firebase Admin session expired — customer bills & settings cannot sync until you sign in again.'
+              : isAr
+              ? 'تنبيه: تم تسجيل الدخول ببريد غير موثق — قواعد الأمان تتطلب الدخول بحساب Google المعتمد لحفظ الفواتير.'
+              : 'Unverified Email session — Firestore rules require Google Sign-In (verified email) to push customer bill ledgers.'}
+          </span>
+          {onReauthenticateAdmin && (
+            <button
+              type="button"
+              onClick={onReauthenticateAdmin}
+              className="px-3 py-1.5 rounded-xl bg-rose-700 hover:bg-rose-800 text-white text-xs font-extrabold cursor-pointer shrink-0"
+            >
+              {isAr ? 'تسجيل الدخول بـ Google' : 'Sign in with Google'}
+            </button>
+          )}
+        </div>
+      )}
+
       {syncBannerMsg && (
-        <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold flex items-center justify-between gap-2">
+        <div
+          className={`p-3.5 rounded-2xl border text-xs font-bold flex items-center justify-between gap-2 ${
+            syncBannerTone === 'error'
+              ? 'bg-rose-50 border-rose-300 text-rose-900'
+              : syncBannerTone === 'warning'
+              ? 'bg-amber-50 border-amber-300 text-amber-950'
+              : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+          }`}
+        >
           <span>{syncBannerMsg}</span>
           <button
             type="button"
             onClick={() => setSyncBannerMsg(null)}
-            className="text-emerald-700 hover:text-emerald-950 font-bold cursor-pointer"
+            className="font-bold cursor-pointer shrink-0 opacity-75 hover:opacity-100"
           >
             ✕
           </button>

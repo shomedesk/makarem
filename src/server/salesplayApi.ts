@@ -271,7 +271,7 @@ interface IndexedReceiptRecord {
   }>;
 }
 
-const CUSTOMER_LIST_CACHE_TTL_MS = 45 * 1000;
+const CUSTOMER_LIST_CACHE_TTL_MS = 10 * 1000;
 let cachedCustomersList: { items: any[]; fetchedAtMs: number } | null = null;
 
 async function getCustomersCached(forceRefresh = false): Promise<any[]> {
@@ -288,7 +288,8 @@ async function getCustomersCached(forceRefresh = false): Promise<any[]> {
   return items;
 }
 
-const RECEIPT_INCREMENTAL_COOLDOWN_MS = 15 * 1000;
+const RECEIPT_INCREMENTAL_COOLDOWN_MS = 5 * 1000;
+const RECEIPT_FULL_REBUILD_INTERVAL_MS = 10 * 60 * 1000;
 const receiptIndex = {
   byNumber: new Map<string, IndexedReceiptRecord>(),
   bootstrappedAtMs: 0,
@@ -319,7 +320,7 @@ function normalizeRawReceipt(r: any): IndexedReceiptRecord {
   const rCust = r.customer?.[0];
 
   return {
-    receiptNumber: String(r.receipt_number || ''),
+    receiptNumber: String(r.receipt_number || '').trim(),
     receiptType: r.receipt_type || 'SALE',
     dateTime: r.receipt_date_time || `${r.receipt_date} ${r.receipt_time}`,
     customerId: String(r.customer_id || rCust?.id || ''),
@@ -378,7 +379,10 @@ async function ensureReceiptsSynced(
   }
 
   const nowMs = Date.now();
-  const needsBootstrap = receiptIndex.bootstrappedAtMs === 0 || forceFullRebuild;
+  const needsBootstrap =
+    receiptIndex.bootstrappedAtMs === 0 ||
+    forceFullRebuild ||
+    nowMs - receiptIndex.bootstrappedAtMs >= RECEIPT_FULL_REBUILD_INTERVAL_MS;
   const needsIncremental =
     forceRefresh || nowMs - receiptIndex.lastIncrementalSyncMs >= RECEIPT_INCREMENTAL_COOLDOWN_MS;
 
@@ -390,7 +394,7 @@ async function ensureReceiptsSynced(
     const now = new Date();
     const maxWindow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-    if (receiptIndex.bootstrappedAtMs === 0 || forceFullRebuild) {
+    if (needsBootstrap) {
       // Full 90-day authoritative rebuild in three parallel 30-day windows (removes any deleted POS bills!)
       const d30 = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
       const d60 = new Date(now.getTime() - 58 * 24 * 60 * 60 * 1000);

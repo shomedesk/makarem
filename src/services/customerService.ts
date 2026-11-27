@@ -1,6 +1,7 @@
 import {
   doc,
   getDoc,
+  getDocFromServer,
   setDoc,
   deleteDoc,
   collection,
@@ -446,13 +447,16 @@ async function allocateNextCustomerCode(
 }
 
 export async function refreshCustomerProfileFromFirestore(
-  current: CustomerProfile
+  current: CustomerProfile,
+  fromServer = false
 ): Promise<CustomerProfile | null> {
   try {
     let matchedDoc: CustomerProfile | null = null;
+    const readDoc = async (ref: ReturnType<typeof doc>) =>
+      fromServer ? getDocFromServer(ref).catch(() => getDoc(ref)) : getDoc(ref);
 
     if (current.id) {
-      const direct = await getDoc(doc(db, 'customers', current.id));
+      const direct = await readDoc(doc(db, 'customers', current.id));
       if (direct.exists()) {
         matchedDoc = { id: direct.id, ...direct.data() } as CustomerProfile;
       }
@@ -460,7 +464,7 @@ export async function refreshCustomerProfileFromFirestore(
 
     if (!matchedDoc && current.customerCode) {
       const safeId = `cust_${current.customerCode.trim().replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
-      const byCustId = await getDoc(doc(db, 'customers', safeId));
+      const byCustId = await readDoc(doc(db, 'customers', safeId));
       if (byCustId.exists()) {
         matchedDoc = { id: byCustId.id, ...byCustId.data() } as CustomerProfile;
       } else {
@@ -734,8 +738,11 @@ export interface CustomerFirestoreSyncResult {
   customersSynced: number;
   ledgersWritten: number;
   ledgersTotal: number;
+  failedLedgers: number;
   posConnected: boolean;
   requiresAuth?: boolean;
+  requiresVerifiedEmail?: boolean;
+  errors?: string[];
 }
 
 const lastSyncedProfileDigests = new Map<string, string>();
@@ -761,6 +768,7 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
   let snapshots: any[] = [];
   let windowStartDate = '';
   let posConnected = false;
+  const errors: string[] = [];
 
   if (shouldSyncLedgers) {
     try {
@@ -787,7 +795,10 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
   let posCustomers: AdminCustomerRecord[] = [];
   if (!onlyChanged || snapshots.length === 0 || lastSyncedProfileDigests.size === 0) {
     const all = await fetchAllCustomersForAdmin();
-    posCustomers = all.filter((c) => Boolean(c.salesplayId && c.customerCode));
+    // CRITICAL: Only treat genuine live SalesPlay records (source !== 'firestore') as POS-connected!
+    posCustomers = all.filter(
+      (c) => c.source !== 'firestore' && Boolean(c.salesplayId && c.customerCode)
+    );
     if (posCustomers.length > 0) {
       posConnected = true;
     }
@@ -804,12 +815,14 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
     }
   }
 
-  if (posCustomers.length === 0 && snapshots.length === 0) {
+  if (!posConnected || (posCustomers.length === 0 && snapshots.length === 0)) {
     return {
       customersSynced: 0,
       ledgersWritten: 0,
       ledgersTotal: 0,
-      posConnected,
+      failedLedgers: 0,
+      posConnected: false,
+      errors,
     };
   }
 
@@ -836,6 +849,7 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
     const chunk = sourceList.slice(i, i + 400);
     const batch = writeBatch(db);
     let chunkWrites = 0;
+    const committedCodes: Array<{ code: string; digest: string; meta: { firestoreId: string; createdAt: string; phone: string; phoneNormalized: string } }> = [];
 
     for (const c of chunk) {
       const code = String(c.customerCode || '').trim();
@@ -869,7 +883,7 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
           // treat as new doc
         }
       }
-      const createdAtToWrite = preservedCreatedAt || now;
+      const createdAtToWrite = String(preservedCreatedAt || now).slice(0, 64);
 
       batch.set(
         doc(db, 'customers', docId),
@@ -891,31 +905,48 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
         },
         { merge: true }
       );
-      knownCustomerDocMeta.set(code, {
-        firestoreId: docId,
-        createdAt: createdAtToWrite,
-        phone,
-        phoneNormalized,
+      committedCodes.push({
+        code,
+        digest: profileDigest,
+        meta: {
+          firestoreId: docId,
+          createdAt: createdAtToWrite,
+          phone,
+          phoneNormalized,
+        },
       });
-      lastSyncedProfileDigests.set(code, profileDigest);
       chunkWrites++;
     }
 
     if (chunkWrites > 0) {
-      await batch.commit();
-      customersSynced += chunkWrites;
+      try {
+        await batch.commit();
+        customersSynced += chunkWrites;
+        for (const item of committedCodes) {
+          knownCustomerDocMeta.set(item.code, item.meta);
+          lastSyncedProfileDigests.set(item.code, item.digest);
+        }
+      } catch (err: any) {
+        const msg = err?.message || 'Could not write customers to Firestore';
+        errors.push(`customers: ${msg}`);
+        console.warn('Customers batch write error:', err);
+      }
     }
   }
 
   let ledgersWritten = 0;
   let ledgersTotal = 0;
+  let failedLedgers = 0;
   let requiresAuth = false;
+  let requiresVerifiedEmail = false;
 
   // Sync each customer's bills & credit metadata into customer_ledgers/{customerCode}
   if (shouldSyncLedgers && snapshots.length > 0) {
     await auth.authStateReady();
     if (!auth.currentUser?.email) {
       requiresAuth = true;
+    } else if (!auth.currentUser.emailVerified) {
+      requiresVerifiedEmail = true;
     } else {
       const [{ fetchAllSettlementsForAdmin, computeEnrichedCustomerBills }, { syncCustomerLedgerToFirestore }] =
         await Promise.all([
@@ -940,7 +971,9 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
         const receiptSig = (s.receipts || [])
           .map(
             (r: any) =>
-              `${r.receiptNumber}:${r.receiptType}:${Number(r.creditAmount || 0).toFixed(3)}:${Number(
+              `${r.receiptNumber}:${r.receiptType}:${r.dateTime || ''}:${Number(
+                r.creditAmount || 0
+              ).toFixed(3)}:${Number(r.paidAmount || 0).toFixed(3)}:${Number(
                 r.totalMoney || 0
               ).toFixed(3)}`
           )
@@ -948,7 +981,7 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
         const settleSig = custSettlements.map((st: any) => `${st.id}:${st.settledAmount}`).join(',');
         const ledgerDigest = `${s.name || ''}|${s.phone || ''}|${s.creditLimit ?? ''}|${
           s.totalVisits ?? 0
-        }|${receiptSig}|${settleSig}`;
+        }|${Number(s.totalSpent || 0).toFixed(3)}|${receiptSig}|${settleSig}`;
         if (onlyChanged && lastSyncedLedgerDigests.get(code) === ledgerDigest) {
           ledgersTotal++;
           return false;
@@ -968,22 +1001,35 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
               custSettlements,
               s.creditLimit ?? null
             );
-            const outcome = await syncCustomerLedgerToFirestore(code, enriched.bills, {
-              customerName: s.name || undefined,
-              customerPhone: s.phone || undefined,
-              creditLimit: s.creditLimit ?? null,
-              totalVisits: Number(s.totalVisits || 0),
-              totalSpent: Number(s.totalSpent || 0),
-              firstVisit: s.firstVisit || undefined,
-              authoritativeWindowStart: windowStartDate || undefined,
-            }).catch((err) => {
-              console.warn(`Ledger sync skipped for #${code}:`, err);
+            try {
+              const outcome = await syncCustomerLedgerToFirestore(code, enriched.bills, {
+                customerName: s.name || undefined,
+                customerPhone: s.phone || undefined,
+                creditLimit: s.creditLimit ?? null,
+                totalVisits: Number(s.totalVisits || 0),
+                totalSpent: Number(s.totalSpent || 0),
+                firstVisit: s.firstVisit || undefined,
+                authoritativeWindowStart: windowStartDate || undefined,
+                forceServerRead: !onlyChanged,
+              });
+              if (outcome === 'written' || outcome === 'unchanged') {
+                lastSyncedLedgerDigests.set(code, (s as any).__ledgerDigest || '');
+              } else if (outcome === 'unauthorized') {
+                requiresAuth = true;
+              } else if (outcome === 'unverified') {
+                requiresVerifiedEmail = true;
+              } else {
+                failedLedgers++;
+                errors.push(`#${code}: invalid ledger payload`);
+              }
+              return outcome;
+            } catch (err: any) {
+              failedLedgers++;
+              const msg = err?.message || 'Permission denied or write failed';
+              errors.push(`#${code}: ${msg}`);
+              console.warn(`Ledger sync failed for #${code}:`, err);
               return 'invalid' as const;
-            });
-            if (outcome === 'written' || outcome === 'unchanged') {
-              lastSyncedLedgerDigests.set(code, (s as any).__ledgerDigest || '');
             }
-            return outcome;
           })
         );
 
@@ -1003,7 +1049,10 @@ export async function syncAllSalesPlayCustomersToFirestore(options?: {
     customersSynced,
     ledgersWritten,
     ledgersTotal,
+    failedLedgers,
     posConnected,
     requiresAuth,
+    requiresVerifiedEmail,
+    errors,
   };
 }

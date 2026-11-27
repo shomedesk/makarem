@@ -1,4 +1,4 @@
-import { doc, getDoc, onSnapshot, setDoc, type Unsubscribe } from 'firebase/firestore';
+import { doc, getDoc, getDocFromServer, onSnapshot, setDoc, type Unsubscribe } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import type {
   ArchivedBillEntry,
@@ -36,6 +36,7 @@ export interface CustomerLedgerMeta {
   totalSpent?: number;
   firstVisit?: string;
   authoritativeWindowStart?: string;
+  forceServerRead?: boolean;
 }
 
 export function loadLocalBillArchive(customerCode: string): LocalBillArchive | null {
@@ -97,15 +98,20 @@ export function saveLocalBillArchive(
 
 /**
  * Reads a customer's single compact Firestore ledger document (1 read total).
+ * Uses getDocFromServer when fromServer=true so stale client cache never hides new/deleted bills.
  */
 export async function fetchCustomerLedgerDoc(
-  customerCode: string
+  customerCode: string,
+  fromServer = false
 ): Promise<CustomerLedgerDoc | null> {
   const docId = toLedgerDocId(customerCode);
   if (!docId || docId === 'unknown') return null;
 
+  const ref = doc(db, 'customer_ledgers', docId);
   try {
-    const snap = await getDoc(doc(db, 'customer_ledgers', docId));
+    const snap = fromServer
+      ? await getDocFromServer(ref).catch(() => getDoc(ref))
+      : await getDoc(ref);
     if (!snap.exists()) return null;
     return snap.data() as CustomerLedgerDoc;
   } catch (err) {
@@ -194,7 +200,8 @@ function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerRece
 
 /**
  * Merges Firestore ledger archive + local browser archive + fresh delta POS receipts.
- * Guarantees latest server/settlement data overwrites archived summaries without duplicates.
+ * When authoritativeCloudSnapshot=true (launched static hosts where POS backend is unreachable),
+ * Firestore ledgerDoc is treated as sole truth so deleted/edited POS bills NEVER survive in localStorage.
  */
 export function mergeArchivedAndDeltaReceipts(params: {
   ledgerDoc: CustomerLedgerDoc | null;
@@ -202,6 +209,7 @@ export function mergeArchivedAndDeltaReceipts(params: {
   deltaReceipts: SalesPlayCustomerReceipt[];
   activeReceiptNumbers?: string[];
   windowStartDate?: string;
+  authoritativeCloudSnapshot?: boolean;
 }): {
   mergedReceipts: SalesPlayCustomerReceipt[];
   openBillNumbers: string[];
@@ -209,39 +217,65 @@ export function mergeArchivedAndDeltaReceipts(params: {
 } {
   const byReceiptNo = new Map<string, SalesPlayCustomerReceipt>();
 
-  // 1. Seed from Firestore ledger snapshot (works on offline/launched devices & new browsers)
-  if (params.ledgerDoc?.archivedBills?.length) {
-    for (const entry of params.ledgerDoc.archivedBills) {
-      if (entry.receiptNumber) {
-        byReceiptNo.set(entry.receiptNumber, archivedEntryToReceipt(entry));
+  if (params.authoritativeCloudSnapshot && params.ledgerDoc) {
+    const localByRecNo = new Map<string, SalesPlayCustomerReceipt>();
+    for (const rec of params.localArchive?.receipts || []) {
+      if (rec?.receiptNumber) {
+        localByRecNo.set(rec.receiptNumber, rec);
       }
     }
-  }
 
-  // 2. Overlay local browser archive (preserves line-item breakdown on this device)
-  if (params.localArchive?.receipts?.length) {
-    for (const rec of params.localArchive.receipts) {
+    for (const entry of params.ledgerDoc.archivedBills || []) {
+      if (!entry?.receiptNumber) continue;
+      const cloudRec = archivedEntryToReceipt(entry);
+      const cached = localByRecNo.get(entry.receiptNumber);
+      // Only reuse cached line-items if totals and credit amounts still match identically
+      if (
+        cached &&
+        Array.isArray(cached.items) &&
+        cached.items.length > 0 &&
+        Math.abs(Number(cached.totalMoney || 0) - Number(cloudRec.totalMoney || 0)) < 0.001 &&
+        Math.abs(Number(cached.creditAmount || 0) - Number(cloudRec.creditAmount || 0)) < 0.001
+      ) {
+        cloudRec.items = cached.items;
+      }
+      byReceiptNo.set(entry.receiptNumber, cloudRec);
+    }
+  } else {
+    // 1. Seed from Firestore ledger snapshot (works on offline/launched devices & new browsers)
+    if (params.ledgerDoc?.archivedBills?.length) {
+      for (const entry of params.ledgerDoc.archivedBills) {
+        if (entry.receiptNumber) {
+          byReceiptNo.set(entry.receiptNumber, archivedEntryToReceipt(entry));
+        }
+      }
+    }
+
+    // 2. Overlay local browser archive (preserves line-item breakdown on this device)
+    if (params.localArchive?.receipts?.length) {
+      for (const rec of params.localArchive.receipts) {
+        if (rec.receiptNumber) {
+          byReceiptNo.set(rec.receiptNumber, rec);
+        }
+      }
+    }
+
+    // 3. Overlay live delta receipts from SalesPlay POS (newest truth always wins!)
+    for (const rec of params.deltaReceipts) {
       if (rec.receiptNumber) {
         byReceiptNo.set(rec.receiptNumber, rec);
       }
     }
-  }
 
-  // 3. Overlay live delta receipts from SalesPlay POS (newest truth always wins!)
-  for (const rec of params.deltaReceipts) {
-    if (rec.receiptNumber) {
-      byReceiptNo.set(rec.receiptNumber, rec);
-    }
-  }
-
-  // 4. Prune any bills inside the authoritative POS window that were deleted from SalesPlay POS
-  if (Array.isArray(params.activeReceiptNumbers)) {
-    const activeSet = new Set(params.activeReceiptNumbers.map((n) => String(n).trim()).filter(Boolean));
-    const cutoff = String(params.windowStartDate || '').trim();
-    for (const [recNo, rec] of byReceiptNo.entries()) {
-      const inPosWindow = !cutoff || !rec.dateTime || rec.dateTime >= cutoff;
-      if (inPosWindow && !activeSet.has(recNo)) {
-        byReceiptNo.delete(recNo);
+    // 4. Prune any bills inside the authoritative POS window that were deleted from SalesPlay POS
+    if (Array.isArray(params.activeReceiptNumbers)) {
+      const activeSet = new Set(params.activeReceiptNumbers.map((n) => String(n).trim()).filter(Boolean));
+      const cutoff = String(params.windowStartDate || '').trim();
+      for (const [recNo, rec] of byReceiptNo.entries()) {
+        const inPosWindow = !cutoff || !rec.dateTime || rec.dateTime >= cutoff;
+        if (inPosWindow && !activeSet.has(recNo)) {
+          byReceiptNo.delete(recNo);
+        }
       }
     }
   }
@@ -273,7 +307,7 @@ export function mergeArchivedAndDeltaReceipts(params: {
   };
 }
 
-export type LedgerSyncOutcome = 'written' | 'unchanged' | 'unauthorized' | 'invalid';
+export type LedgerSyncOutcome = 'written' | 'unchanged' | 'unauthorized' | 'unverified' | 'invalid';
 
 /**
  * Admin-only: Syncs BOTH open due/partial bills AND finalized Paid/Settled bills plus credit metadata
@@ -287,6 +321,7 @@ export async function syncCustomerLedgerToFirestore(
 ): Promise<LedgerSyncOutcome> {
   await auth.authStateReady();
   if (!auth.currentUser?.email) return 'unauthorized';
+  if (!auth.currentUser.emailVerified) return 'unverified';
   const docId = toLedgerDocId(customerCode);
   if (!docId || docId === 'unknown') return 'invalid';
 
@@ -295,8 +330,11 @@ export async function syncCustomerLedgerToFirestore(
 
   let existingDoc: CustomerLedgerDoc | null = null;
   const authoritativeCutoff = String(meta?.authoritativeWindowStart || '').trim();
+  const ledgerRef = doc(db, 'customer_ledgers', docId);
   try {
-    const snap = await getDoc(doc(db, 'customer_ledgers', docId));
+    const snap = meta?.forceServerRead
+      ? await getDocFromServer(ledgerRef).catch(() => getDoc(ledgerRef))
+      : await getDoc(ledgerRef);
     if (snap.exists()) {
       existingDoc = snap.data() as CustomerLedgerDoc;
       for (const oldEntry of existingDoc.archivedBills || []) {
@@ -374,9 +412,13 @@ export async function syncCustomerLedgerToFirestore(
       .reduce((s, b) => s + Number(b.totalMoney || 0), 0)
   );
 
-  const nextCreditLimit =
+  const rawCreditLimit =
     meta?.creditLimit !== undefined ? meta.creditLimit : existingDoc?.creditLimit ?? null;
-  const nextHasCreditLimit = nextCreditLimit !== null && nextCreditLimit !== undefined;
+  const nextCreditLimit =
+    rawCreditLimit !== null && rawCreditLimit !== undefined && Number.isFinite(Number(rawCreditLimit))
+      ? round3(Math.max(0, Number(rawCreditLimit)))
+      : null;
+  const nextHasCreditLimit = nextCreditLimit !== null;
   const nextTotalVisits =
     meta?.totalVisits !== undefined
       ? Math.max(0, Math.floor(Number(meta.totalVisits || 0)))
@@ -414,6 +456,7 @@ export async function syncCustomerLedgerToFirestore(
     digestEntries(existingDoc.archivedBills) === digestEntries(cappedBills) &&
     (existingDoc.creditLimit ?? null) === (nextCreditLimit ?? null) &&
     (existingDoc.totalVisits ?? null) === (nextTotalVisits ?? null) &&
+    Math.abs(Number(existingDoc.totalSpent || 0) - Number(nextTotalSpent || 0)) < 0.001 &&
     (existingDoc.customerName || '') === (nextCustomerName || '') &&
     (existingDoc.customerPhone || '') === (nextCustomerPhone || '') &&
     Math.abs(Number(existingDoc.totalArchivedPaidAmount || 0) - totalArchivedPaidAmount) < 0.001
@@ -434,7 +477,7 @@ export async function syncCustomerLedgerToFirestore(
     totalArchivedBills,
     totalArchivedPaidAmount,
     archivedBills: cappedBills,
-    createdAt: existingDoc?.createdAt || now,
+    createdAt: String(existingDoc?.createdAt || now).slice(0, 64),
     updatedAt: now,
   };
 
