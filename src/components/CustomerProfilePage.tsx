@@ -109,7 +109,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
           refreshCustomerProfileFromFirestore(cust, true),
           fetchCustomerOrders(cust.phone, cust.customerCode),
           fetchCustomerLedgerDoc(cust.customerCode, true),
-          fetchCustomerSettlements(cust.customerCode),
+          fetchCustomerSettlements(cust.customerCode, true),
         ]);
 
       let ledgerDoc = primaryLedger;
@@ -158,7 +158,7 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
         if (canonicalCode && canonicalCode !== activeCust.customerCode) {
           const [extraLedger, extraSettlements] = await Promise.all([
             fetchCustomerLedgerDoc(canonicalCode, true),
-            fetchCustomerSettlements(canonicalCode),
+            fetchCustomerSettlements(canonicalCode, true),
           ]);
           canonicalLedger = extraLedger || ledgerDoc;
           setLedgerMeta(canonicalLedger);
@@ -251,29 +251,19 @@ export const CustomerProfilePage: React.FC<CustomerProfilePageProps> = ({
     setVisibleBillCount(BILLS_PAGE_SIZE);
   }, [billFilter]);
 
-  // Scoped real-time listener attached ONLY when this customer has open Due bills or recorded settlements
+  // Scoped real-time listener for recorded settlements so Admin Clear/Settlement flips this dashboard live
   const effectiveCustomerCode =
     posProfile?.customer?.customerCode || profile?.customerCode || '';
-  const hasOpenCreditOrSettlements = useMemo(
-    () =>
-      settlements.length > 0 ||
-      mergedReceipts.some(
-        (r) =>
-          Number(r.creditAmount || 0) > 0 &&
-          String(r.receiptType || '').toUpperCase() !== 'REFUND'
-      ),
-    [mergedReceipts, settlements.length]
-  );
 
   useEffect(() => {
-    if (!effectiveCustomerCode || !hasOpenCreditOrSettlements) {
+    if (!effectiveCustomerCode) {
       return;
     }
     const unsub = subscribeToCustomerSettlements(effectiveCustomerCode, (records) => {
       setSettlements(records);
     });
     return () => unsub();
-  }, [effectiveCustomerCode, hasOpenCreditOrSettlements]);
+  }, [effectiveCustomerCode]);
 
   // Live 1-doc listener on Firestore customer_ledgers/{code} so launched/static dashboards
   // update immediately whenever Admin syncs new or deleted POS bills!

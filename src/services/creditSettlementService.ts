@@ -3,6 +3,7 @@ import {
   deleteDoc,
   doc,
   getDocs,
+  getDocsFromServer,
   limit,
   onSnapshot,
   query,
@@ -24,7 +25,8 @@ const round3 = (n: number): number => Math.round(n * 1000) / 1000;
  * Fetches all recorded bill settlements for a specific customerCode.
  */
 export async function fetchCustomerSettlements(
-  customerCode: string
+  customerCode: string,
+  fromServer = false
 ): Promise<CreditSettlementRecord[]> {
   const cleanCode = String(customerCode || '').trim();
   if (!cleanCode) return [];
@@ -36,7 +38,7 @@ export async function fetchCustomerSettlements(
   );
 
   try {
-    const snap = await getDocs(q);
+    const snap = fromServer ? await getDocsFromServer(q).catch(() => getDocs(q)) : await getDocs(q);
     const items: CreditSettlementRecord[] = [];
     snap.forEach((d) => {
       items.push({ id: d.id, ...(d.data() as Omit<CreditSettlementRecord, 'id'>) });
@@ -52,10 +54,12 @@ export async function fetchCustomerSettlements(
  * Admin-only: Fetches all credit settlements so the Admin Reports & Debtors dashboard
  * shows exact Net Unpaid Credit across every customer.
  */
-export async function fetchAllSettlementsForAdmin(): Promise<CreditSettlementRecord[]> {
+export async function fetchAllSettlementsForAdmin(
+  fromServer = false
+): Promise<CreditSettlementRecord[]> {
   try {
     const q = query(collection(db, 'credit_settlements'), limit(500));
-    const snap = await getDocs(q);
+    const snap = fromServer ? await getDocsFromServer(q).catch(() => getDocs(q)) : await getDocs(q);
     const items: CreditSettlementRecord[] = [];
     snap.forEach((d) => {
       items.push({ id: d.id, ...(d.data() as Omit<CreditSettlementRecord, 'id'>) });

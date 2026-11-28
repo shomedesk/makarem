@@ -44,6 +44,7 @@ import type {
   AdminCustomerRecord,
   AdminInsightsResponse,
   CreditSettlementRecord,
+  CustomerLedgerDoc,
   Order,
   OrderStatus,
   InventoryItem,
@@ -62,7 +63,14 @@ import {
   extractCustomerIdentifier,
   normalizePhoneNumber,
 } from '../services/customerService';
-import { fetchAllSettlementsForAdmin } from '../services/creditSettlementService';
+import {
+  computeEnrichedCustomerBills,
+  fetchAllSettlementsForAdmin,
+} from '../services/creditSettlementService';
+import {
+  fetchAllCustomerLedgersForAdmin,
+  ledgerDocToReceipts,
+} from '../services/billArchiveService';
 import { playNewOrderChime } from '../utils/audio';
 import {
   connectBluetooth58mmPrinter,
@@ -148,9 +156,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [customerFilter, setCustomerFilter] = useState<'all' | 'with_due' | 'near_limit' | 'synced'>('all');
   const [reportPeriod, setReportPeriod] = useState<'today' | 'd7' | 'd30' | 'd90'>('today');
 
-  // Admin Store Insights & Credit Settlements state
+  // Admin Store Insights, Ledgers & Credit Settlements state
   const [insights, setInsights] = useState<AdminInsightsResponse | null>(null);
   const [allSettlements, setAllSettlements] = useState<CreditSettlementRecord[]>([]);
+  const [ledgerDocsByCode, setLedgerDocsByCode] = useState<Record<string, CustomerLedgerDoc>>({});
   const [isLoadingInsights, setIsLoadingInsights] = useState(false);
 
   // Clear Old Orders confirmation state
@@ -264,13 +273,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const loadAdminAnalytics = async (forceRefresh = false) => {
     setIsLoadingInsights(true);
     try {
-      const [insightsRes, settlementsList, custList] = await Promise.all([
+      const [insightsRes, settlementsList, ledgersMap, custList] = await Promise.all([
         fetch(`/api/salesplay/admin-insights${forceRefresh ? '?force=1' : ''}`, {
           cache: 'no-store',
         })
-          .then((r) => (r.ok ? r.json() : null))
+          .then(async (r) => {
+            const ct = r.headers.get('content-type') || '';
+            return r.ok && ct.includes('application/json') ? r.json() : null;
+          })
           .catch(() => null),
-        fetchAllSettlementsForAdmin(),
+        fetchAllSettlementsForAdmin(true),
+        fetchAllCustomerLedgersForAdmin(true),
         customers.length === 0 || forceRefresh
           ? fetchAllCustomersForAdmin()
           : Promise.resolve(customers),
@@ -279,6 +292,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         setInsights(insightsRes as AdminInsightsResponse);
       }
       setAllSettlements(settlementsList);
+      setLedgerDocsByCode(ledgersMap);
       if (Array.isArray(custList) && custList.length > 0) {
         setCustomers(custList);
       }
@@ -401,6 +415,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return matchesStatus && matchesSearch;
   });
 
+  const settlementsListByCustomerCode = React.useMemo(() => {
+    const map: Record<string, CreditSettlementRecord[]> = {};
+    for (const st of allSettlements) {
+      const code = String(st.customerCode || '').trim();
+      if (!code) continue;
+      if (!map[code]) map[code] = [];
+      map[code].push(st);
+    }
+    return map;
+  }, [allSettlements]);
+
   const settlementsByCustomerCode = React.useMemo(() => {
     const map: Record<string, number> = {};
     for (const st of allSettlements) {
@@ -413,32 +438,71 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const enrichedCustomers = React.useMemo(() => {
     const stats = insights?.customerStats || {};
+    const hasLiveInsights = Boolean(insights?.success);
+
     return customers.map((cust) => {
       const stat =
         (cust.customerCode && stats[cust.customerCode]) ||
         (cust.salesplayId && stats[cust.salesplayId]) ||
         null;
-      const posCredit = Number(stat?.posGrossCredit || 0);
-      const adminSettled = Number(settlementsByCustomerCode[cust.customerCode] || 0);
-      const netDue = Math.max(0, Math.round((posCredit - Math.min(posCredit, adminSettled)) * 1000) / 1000);
+      const ledgerDoc = cust.customerCode ? ledgerDocsByCode[cust.customerCode] : undefined;
+      const custSettlements = settlementsListByCustomerCode[cust.customerCode] || [];
+      const effectiveLimit = cust.creditLimit ?? ledgerDoc?.creditLimit ?? null;
+
+      let netDue = 0;
+      let posCredit = 0;
+      let adminSettled = Number(settlementsByCustomerCode[cust.customerCode] || 0);
+      let dueBillsCount = 0;
+
+      if (hasLiveInsights) {
+        posCredit = Number(stat?.posGrossCredit || 0);
+        netDue = Math.max(0, Math.round((posCredit - Math.min(posCredit, adminSettled)) * 1000) / 1000);
+        if (netDue <= 0.0005) {
+          dueBillsCount = 0;
+        } else if (ledgerDoc) {
+          dueBillsCount = computeEnrichedCustomerBills(
+            ledgerDocToReceipts(ledgerDoc),
+            custSettlements,
+            effectiveLimit
+          ).dueBills.length || Number(stat?.dueBillsCount || 0);
+        } else {
+          dueBillsCount = Number(stat?.dueBillsCount || 0);
+        }
+      } else if (ledgerDoc) {
+        const ledgerEnriched = computeEnrichedCustomerBills(
+          ledgerDocToReceipts(ledgerDoc),
+          custSettlements,
+          effectiveLimit
+        );
+        netDue = ledgerEnriched.totalDueNow;
+        posCredit = ledgerEnriched.totalDueNow + ledgerEnriched.totalSettledViaAdmin;
+        dueBillsCount = ledgerEnriched.dueBills.length;
+      }
+
       const limitPct =
-        cust.creditLimit !== null && cust.creditLimit > 0
-          ? Math.min(100, Math.round((netDue / cust.creditLimit) * 1000) / 10)
+        effectiveLimit !== null && effectiveLimit > 0
+          ? Math.min(100, Math.round((netDue / effectiveLimit) * 1000) / 10)
           : 0;
-      const effectiveSpent = Math.max(Number(cust.totalSpent || 0), Number(stat?.spent90d || 0));
+      const effectiveSpent = Math.max(
+        Number(cust.totalSpent || 0),
+        Number(stat?.spent90d || 0),
+        Number(ledgerDoc?.totalSpent || 0)
+      );
       return {
         ...cust,
+        creditLimit: effectiveLimit,
+        totalVisits: cust.totalVisits || Number(ledgerDoc?.totalVisits || 0),
         netDue,
         posGrossCredit: posCredit,
         adminSettled,
-        dueBillsCount: stat?.dueBillsCount || 0,
+        dueBillsCount,
         spent90d: Number(stat?.spent90d || 0),
         effectiveSpent,
         lastPurchaseDate: stat?.lastPurchaseDate || '',
         limitPct,
       };
     });
-  }, [customers, insights?.customerStats, settlementsByCustomerCode]);
+  }, [customers, insights, ledgerDocsByCode, settlementsByCustomerCode, settlementsListByCustomerCode]);
 
   const totalStoreOutstandingDue = React.useMemo(
     () =>
@@ -3193,9 +3257,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       <CustomerCreditSettlementModal
         customer={creditCustomerModal}
+        onSettledChange={() => {
+          loadAdminAnalytics(true);
+        }}
         onClose={() => {
           setCreditCustomerModal(null);
-          loadAdminAnalytics(false);
+          loadAdminAnalytics(true);
         }}
         language={language}
       />

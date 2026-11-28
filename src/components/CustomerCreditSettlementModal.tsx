@@ -10,22 +10,27 @@ import {
   Smartphone,
   RotateCcw,
   RefreshCw,
+  CheckCheck,
 } from 'lucide-react';
 import type {
   AdminCustomerRecord,
   CreditSettlementRecord,
+  CustomerLedgerDoc,
   EnrichedCustomerReceipt,
   SalesPlayCustomerProfileResponse,
+  SalesPlayCustomerReceipt,
 } from '../types';
 import { fetchSalesPlayCustomerProfile } from '../services/customerService';
 import {
   computeEnrichedCustomerBills,
+  fetchCustomerSettlements,
   recordBillSettlement,
   subscribeToCustomerSettlements,
   undoBillSettlement,
 } from '../services/creditSettlementService';
 import {
   fetchCustomerLedgerDoc,
+  ledgerDocToReceipts,
   mergeArchivedAndDeltaReceipts,
   syncCustomerLedgerToFirestore,
 } from '../services/billArchiveService';
@@ -33,21 +38,44 @@ import {
 interface CustomerCreditSettlementModalProps {
   customer: AdminCustomerRecord | null;
   onClose: () => void;
+  onSettledChange?: () => void;
   language: 'en' | 'ar';
+}
+
+function formatSettlementError(err: unknown, isAr: boolean): string {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      const inner = String(parsed?.error || '');
+      if (inner.toLowerCase().includes('permission')) {
+        return isAr
+          ? 'تم رفض الإذن: يرجى تسجيل الدخول بحساب Google المعتمد للإدارة لتسوية الفواتير.'
+          : 'Permission denied: Please sign in with your verified Admin Google Account to record settlements.';
+      }
+      if (inner) return inner;
+    } catch {
+      // fall back to raw message
+    }
+  }
+  return raw || (isAr ? 'حدث خطأ أثناء الحفظ' : 'Operation failed');
 }
 
 export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementModalProps> = ({
   customer,
   onClose,
+  onSettledChange,
   language,
 }) => {
   const isAr = language === 'ar';
   const [isLoading, setIsLoading] = useState(false);
   const [posProfile, setPosProfile] = useState<SalesPlayCustomerProfileResponse | null>(null);
+  const [cloudLedger, setCloudLedger] = useState<CustomerLedgerDoc | null>(null);
   const [settlements, setSettlements] = useState<CreditSettlementRecord[]>([]);
   const [filterMode, setFilterMode] = useState<'due' | 'all'>('due');
   const [method, setMethod] = useState<'cash' | 'card' | 'online'>('cash');
   const [busyReceipt, setBusyReceipt] = useState<string | null>(null);
+  const [isSettlingAll, setIsSettlingAll] = useState(false);
   const [busyUndoId, setBusyUndoId] = useState<string | null>(null);
   const [partialBillNo, setPartialBillNo] = useState<string | null>(null);
   const [partialAmount, setPartialAmount] = useState<string>('');
@@ -57,14 +85,18 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
   const loadPosData = async (cust: AdminCustomerRecord, forceRefresh = false) => {
     setIsLoading(true);
     try {
-      const [ledgerDoc, data] = await Promise.all([
-        fetchCustomerLedgerDoc(cust.customerCode),
+      const [ledgerDoc, data, freshSettlements] = await Promise.all([
+        fetchCustomerLedgerDoc(cust.customerCode, true),
         fetchSalesPlayCustomerProfile(cust.phone, cust.customerCode, {
           full: true,
           force: forceRefresh,
         }),
+        fetchCustomerSettlements(cust.customerCode, true),
       ]);
-      if (data && ledgerDoc?.archivedBills?.length) {
+      setCloudLedger(ledgerDoc);
+      setSettlements(freshSettlements);
+
+      if (data && data.matched && ledgerDoc?.archivedBills?.length) {
         const merged = mergeArchivedAndDeltaReceipts({
           ledgerDoc,
           localArchive: null,
@@ -86,6 +118,7 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
   useEffect(() => {
     if (!customer) {
       setPosProfile(null);
+      setCloudLedger(null);
       setSettlements([]);
       setStatusMsg(null);
       setPartialBillNo(null);
@@ -99,37 +132,86 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
     return () => unsub();
   }, [customer?.id, customer?.customerCode]);
 
-  const enriched = useMemo(() => {
-    const rawReceipts = posProfile?.receipts || [];
-    const limitVal =
-      posProfile?.creditSummary?.creditLimit ?? customer?.creditLimit ?? null;
-    return computeEnrichedCustomerBills(rawReceipts, settlements, limitVal);
-  }, [posProfile, settlements, customer?.creditLimit]);
+  const rawReceipts: SalesPlayCustomerReceipt[] = useMemo(() => {
+    if (posProfile?.matched && Array.isArray(posProfile.receipts)) {
+      return posProfile.receipts;
+    }
+    return ledgerDocToReceipts(cloudLedger);
+  }, [posProfile, cloudLedger]);
 
-  // Keep Firestore 1-doc ledger archive synchronized when Admin views or modifies settlements
+  const creditLimitVal =
+    posProfile?.creditSummary?.creditLimit ??
+    cloudLedger?.creditLimit ??
+    customer?.creditLimit ??
+    null;
+
+  const enriched = useMemo(() => {
+    return computeEnrichedCustomerBills(rawReceipts, settlements, creditLimitVal);
+  }, [rawReceipts, settlements, creditLimitVal]);
+
+  // Keep Firestore 1-doc ledger archive synchronized whenever POS data updates on Dev Admin
   useEffect(() => {
-    if (!customer?.customerCode || !posProfile || !posProfile.matched) return;
+    if (!customer?.customerCode || !posProfile?.matched) return;
     const code = posProfile.customer?.customerCode || customer.customerCode;
     syncCustomerLedgerToFirestore(code, enriched.bills, {
       customerName: posProfile.customer?.name || customer.name,
       customerPhone: posProfile.customer?.phone || customer.phone,
-      creditLimit: posProfile.creditSummary?.creditLimit ?? customer.creditLimit ?? null,
+      creditLimit: creditLimitVal,
       totalVisits: posProfile.customer?.totalVisits ?? customer.totalVisits,
       totalSpent: posProfile.customer?.totalSpent ?? customer.totalSpent,
       firstVisit: posProfile.customer?.firstVisit || customer.firstVisit,
       authoritativeWindowStart: posProfile.windowStartDate || undefined,
-    }).catch((err) =>
-      console.warn('Ledger archive sync skipped:', err)
-    );
-  }, [customer?.customerCode, customer?.name, customer?.phone, customer?.creditLimit, customer?.totalVisits, customer?.totalSpent, customer?.firstVisit, posProfile, enriched.bills]);
+    }).catch((err) => console.warn('Ledger archive sync skipped:', err));
+  }, [
+    customer?.customerCode,
+    customer?.name,
+    customer?.phone,
+    customer?.totalVisits,
+    customer?.totalSpent,
+    customer?.firstVisit,
+    creditLimitVal,
+    posProfile,
+    enriched.bills,
+  ]);
 
   if (!customer) return null;
 
-  const creditLimitVal =
-    posProfile?.creditSummary?.creditLimit ?? customer.creditLimit ?? null;
+  const persistLedgerAfterMutation = async (
+    nextSettlements: CreditSettlementRecord[],
+    receiptsSource: SalesPlayCustomerReceipt[]
+  ) => {
+    const code = posProfile?.customer?.customerCode || customer.customerCode;
+    const nextEnriched = computeEnrichedCustomerBills(
+      receiptsSource,
+      nextSettlements,
+      creditLimitVal
+    );
+    const outcome = await syncCustomerLedgerToFirestore(code, nextEnriched.bills, {
+      customerName: posProfile?.customer?.name || cloudLedger?.customerName || customer.name,
+      customerPhone: posProfile?.customer?.phone || cloudLedger?.customerPhone || customer.phone,
+      creditLimit: creditLimitVal,
+      totalVisits: posProfile?.customer?.totalVisits ?? cloudLedger?.totalVisits ?? customer.totalVisits,
+      totalSpent: posProfile?.customer?.totalSpent ?? cloudLedger?.totalSpent ?? customer.totalSpent,
+      firstVisit: posProfile?.customer?.firstVisit || cloudLedger?.firstVisit || customer.firstVisit,
+      authoritativeWindowStart: posProfile?.matched ? posProfile.windowStartDate || undefined : undefined,
+      forceServerRead: true,
+    });
+    if (outcome === 'unauthorized' || outcome === 'unverified') {
+      throw new Error(
+        isAr
+          ? 'يلزم تسجيل الدخول بحساب Google المعتمد لتحديث سجل العميل في السحابة.'
+          : 'Verified Admin Google Sign-In is required to update the cloud customer ledger.'
+      );
+    }
+    const refreshedLedger = await fetchCustomerLedgerDoc(code, true);
+    if (refreshedLedger) {
+      setCloudLedger(refreshedLedger);
+    }
+    onSettledChange?.();
+    return nextEnriched;
+  };
 
-  const displayed =
-    filterMode === 'due' ? enriched.dueBills : enriched.bills;
+  const displayed = filterMode === 'due' ? enriched.dueBills : enriched.bills;
 
   const handleSettle = async (
     bill: EnrichedCustomerReceipt,
@@ -147,58 +229,139 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
       return;
     }
 
+    const settleVal = Math.min(rounded, bill.remainingDue);
     setBusyReceipt(bill.receiptNumber);
     setStatusMsg(null);
     try {
-      await recordBillSettlement({
+      const created = await recordBillSettlement({
         customerCode: customer.customerCode,
         receiptNumber: bill.receiptNumber,
         receiptDateTime: bill.dateTime,
         billTotal: bill.totalMoney,
-        originalCreditAmount: bill.originalCreditAmount,
-        settledAmount: Math.min(rounded, bill.remainingDue),
+        originalCreditAmount: bill.originalCreditAmount || bill.creditAmount || bill.totalMoney,
+        settledAmount: settleVal,
         settlementMethod: method,
         note: noteText,
       });
+
+      const nextSettlements = [created, ...settlements.filter((s) => s.id !== created.id)];
+      setSettlements(nextSettlements);
+      const nextEnriched = await persistLedgerAfterMutation(nextSettlements, rawReceipts);
+
       setPartialBillNo(null);
       setPartialAmount('');
       setPartialNote('');
+      const allCleared = nextEnriched.dueBills.length === 0;
       setStatusMsg({
         type: 'ok',
         text: isAr
-          ? `تمت تسوية ${Math.min(rounded, bill.remainingDue).toFixed(3)} OMR من الفاتورة #${bill.receiptNumber}`
-          : `Settled ${Math.min(rounded, bill.remainingDue).toFixed(3)} OMR on Bill #${bill.receiptNumber}. Customer dashboard updated live.`,
+          ? `تمت تسوية ${settleVal.toFixed(3)} OMR من الفاتورة #${bill.receiptNumber}${
+              allCleared ? ' · الحساب الآن خالٍ من أي مستحقات (Clear)' : ''
+            }`
+          : `Settled ${settleVal.toFixed(3)} OMR on Bill #${bill.receiptNumber}${
+              allCleared ? ' · Account is now ALL CLEAR!' : '. Customer dashboard updated live.'
+            }`,
       });
-    } catch (err: any) {
+    } catch (err) {
       setStatusMsg({
         type: 'err',
-        text: err?.message || 'Failed to record settlement',
+        text: formatSettlementError(err, isAr),
       });
     } finally {
       setBusyReceipt(null);
     }
   };
 
-  const handleUndo = async (settlementId: string) => {
-    setBusyUndoId(settlementId);
+  const handleSettleAllDue = async () => {
+    if (enriched.dueBills.length === 0) return;
+    setIsSettlingAll(true);
     setStatusMsg(null);
     try {
-      await undoBillSettlement(settlementId);
+      const createdRecords: CreditSettlementRecord[] = [];
+      for (const bill of enriched.dueBills) {
+        if (bill.remainingDue <= 0.0005) continue;
+        const created = await recordBillSettlement({
+          customerCode: customer.customerCode,
+          receiptNumber: bill.receiptNumber,
+          receiptDateTime: bill.dateTime,
+          billTotal: bill.totalMoney,
+          originalCreditAmount: bill.originalCreditAmount || bill.creditAmount || bill.totalMoney,
+          settledAmount: bill.remainingDue,
+          settlementMethod: method,
+          note: 'Full account settlement',
+        });
+        createdRecords.push(created);
+      }
+
+      const nextSettlements = [...createdRecords, ...settlements];
+      setSettlements(nextSettlements);
+      await persistLedgerAfterMutation(nextSettlements, rawReceipts);
+
+      setPartialBillNo(null);
+      setStatusMsg({
+        type: 'ok',
+        text: isAr
+          ? `تمت تسوية جميع الفواتير (${createdRecords.length}) بالكامل — الحساب الآن خالٍ من المستحقات!`
+          : `Settled all ${createdRecords.length} due bill(s) — Customer dashboard is now ALL CLEAR!`,
+      });
+    } catch (err) {
+      setStatusMsg({
+        type: 'err',
+        text: formatSettlementError(err, isAr),
+      });
+    } finally {
+      setIsSettlingAll(false);
+    }
+  };
+
+  const handleUndo = async (st: CreditSettlementRecord) => {
+    setBusyUndoId(st.id);
+    setStatusMsg(null);
+    try {
+      await undoBillSettlement(st.id);
+      const nextSettlements = settlements.filter((item) => item.id !== st.id);
+      setSettlements(nextSettlements);
+
+      // On Cloud Snapshot mode (launched static host), restore original creditAmount on the undone bill
+      const restoredReceipts = rawReceipts.map((rec) => {
+        if (rec.receiptNumber !== st.receiptNumber) return rec;
+        const hasPosCredit = Number(rec.creditAmount || 0) > 0;
+        if (hasPosCredit) return rec;
+        const restoredCredit = Math.max(0, Number(st.originalCreditAmount || rec.totalMoney || 0));
+        return {
+          ...rec,
+          creditAmount: restoredCredit,
+          paidAmount: Math.max(0, Number(rec.totalMoney || 0) - restoredCredit),
+          hasAdvance: false,
+          payments: [
+            {
+              type: 'Credit',
+              amount: restoredCredit,
+              paidAt: rec.dateTime,
+              isAdvance: false,
+            },
+          ],
+        };
+      });
+
+      await persistLedgerAfterMutation(nextSettlements, restoredReceipts);
       setStatusMsg({
         type: 'ok',
         text: isAr
           ? 'تم التراجع عن التسوية وإعادة الفاتورة كمستحقة'
-          : 'Settlement undone — bill reverted to Due.',
+          : 'Settlement undone — bill reverted to Due on customer dashboard.',
       });
-    } catch (err: any) {
+    } catch (err) {
       setStatusMsg({
         type: 'err',
-        text: err?.message || 'Failed to undo settlement',
+        text: formatSettlementError(err, isAr),
       });
     } finally {
       setBusyUndoId(null);
     }
   };
+
+  const isCloudSnapshotMode = !posProfile?.matched && Boolean(cloudLedger);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/75 backdrop-blur-xs">
@@ -210,7 +373,14 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
               #{customer.customerCode}
             </div>
             <div>
-              <h3 className="font-extrabold text-sm sm:text-base">{customer.name}</h3>
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="font-extrabold text-sm sm:text-base">{customer.name}</h3>
+                {isCloudSnapshotMode && (
+                  <span className="px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-200 text-[10px] font-bold">
+                    {isAr ? 'وضع السحابة' : 'Cloud Mode'}
+                  </span>
+                )}
+              </div>
               <p className="text-[11px] text-slate-300 font-mono">
                 {customer.phone || 'No mobile'} ·{' '}
                 {isAr ? 'إدارة الفواتير المستحقة والتسوية' : 'Credit & Due Bills Settlement'}
@@ -224,7 +394,7 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
               onClick={() => loadPosData(customer, true)}
               disabled={isLoading}
               className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 cursor-pointer"
-              title={isAr ? 'تحديث من POS' : 'Refresh from POS'}
+              title={isAr ? 'تحديث البيانات' : 'Refresh Bills'}
             >
               <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
             </button>
@@ -260,19 +430,21 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
 
           <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
             <div className="text-[11px] font-bold text-emerald-900">
-              {isAr ? 'المتبقي / المسدد' : 'Remaining Credit'}
+              {isAr ? 'المتبقي / الحالة' : creditLimitVal !== null ? 'Remaining Credit' : 'Status'}
             </div>
             <div className="font-black text-sm sm:text-base text-emerald-800 font-mono tabular-nums mt-0.5">
               {enriched.remainingCredit !== null
                 ? `${enriched.remainingCredit.toFixed(3)} OMR`
+                : enriched.totalDueNow <= 0.0005
+                ? 'ALL CLEAR'
                 : `Settled ${enriched.totalSettledViaAdmin.toFixed(3)}`}
             </div>
           </div>
         </div>
 
-        {/* Settlement Method Selector & Filter Bar */}
+        {/* Settlement Method Selector, Filter Bar & Settle All CTA */}
         <div className="px-4 py-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 bg-white shrink-0">
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
               type="button"
               onClick={() => setFilterMode('due')}
@@ -299,6 +471,26 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
                 ? `كل الفواتير (${enriched.bills.length})`
                 : `All Bills (${enriched.bills.length})`}
             </button>
+
+            {enriched.dueBills.length > 0 && (
+              <button
+                type="button"
+                disabled={isSettlingAll || Boolean(busyReceipt)}
+                onClick={handleSettleAllDue}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-extrabold cursor-pointer disabled:opacity-60"
+              >
+                {isSettlingAll ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <CheckCheck className="w-3.5 h-3.5" />
+                )}
+                <span>
+                  {isAr
+                    ? `تسوية الكل (${enriched.totalDueNow.toFixed(3)} OMR)`
+                    : `Clear All (${enriched.totalDueNow.toFixed(3)} OMR)`}
+                </span>
+              </button>
+            )}
           </div>
 
           <div className="flex items-center gap-1.5 text-xs">
@@ -333,14 +525,14 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
         {/* Status Message */}
         {statusMsg && (
           <div
-            className={`mx-4 mt-3 px-3.5 py-2.5 rounded-xl text-xs font-bold flex items-center justify-between shrink-0 ${
+            className={`mx-4 mt-3 px-3.5 py-2.5 rounded-xl text-xs font-bold flex items-center justify-between gap-2 shrink-0 ${
               statusMsg.type === 'ok'
                 ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
                 : 'bg-rose-50 border border-rose-200 text-rose-800'
             }`}
           >
             <span>{statusMsg.text}</span>
-            <button type="button" onClick={() => setStatusMsg(null)} className="cursor-pointer">
+            <button type="button" onClick={() => setStatusMsg(null)} className="cursor-pointer shrink-0">
               ✕
             </button>
           </div>
@@ -358,17 +550,17 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
               <p className="text-sm font-bold text-slate-700">
                 {filterMode === 'due'
                   ? isAr
-                    ? 'لا توجد فواتير مستحقة لهذا العميل'
-                    : 'No unpaid due bills for this customer'
+                    ? 'لا توجد فواتير مستحقة لهذا العميل · الحساب سليم'
+                    : 'All Clear — No unpaid due bills for this customer'
                   : isAr
                   ? 'لا توجد فواتير مسجلة'
-                  : 'No receipts found'}
+                  : 'No receipts synced yet'}
               </p>
             </div>
           ) : (
             displayed.map((bill) => {
               const isDue = bill.billStatus === 'due' || bill.billStatus === 'partial';
-              const isBusy = busyReceipt === bill.receiptNumber;
+              const isBusy = busyReceipt === bill.receiptNumber || isSettlingAll;
               const isPartialOpen = partialBillNo === bill.receiptNumber;
 
               return (
@@ -524,7 +716,7 @@ export const CustomerCreditSettlementModal: React.FC<CustomerCreditSettlementMod
                           <button
                             type="button"
                             disabled={busyUndoId === st.id}
-                            onClick={() => handleUndo(st.id)}
+                            onClick={() => handleUndo(st)}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white hover:bg-rose-50 border border-slate-200 hover:border-rose-300 text-slate-600 hover:text-rose-700 font-bold cursor-pointer shrink-0"
                             title={isAr ? 'تراجع عن التسوية' : 'Undo settlement'}
                           >

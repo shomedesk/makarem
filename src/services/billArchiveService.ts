@@ -1,4 +1,16 @@
-import { doc, getDoc, getDocFromServer, onSnapshot, setDoc, type Unsubscribe } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocFromServer,
+  getDocs,
+  getDocsFromServer,
+  limit,
+  onSnapshot,
+  query,
+  setDoc,
+  type Unsubscribe,
+} from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import type {
   ArchivedBillEntry,
@@ -144,7 +156,30 @@ export function subscribeToCustomerLedgerDoc(
   );
 }
 
-function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerReceipt {
+/**
+ * Admin-only: Fetches all customer_ledgers docs so launched static Admin panels show exact due balances.
+ */
+export async function fetchAllCustomerLedgersForAdmin(
+  fromServer = false
+): Promise<Record<string, CustomerLedgerDoc>> {
+  const result: Record<string, CustomerLedgerDoc> = {};
+  try {
+    const q = query(collection(db, 'customer_ledgers'), limit(500));
+    const snap = fromServer ? await getDocsFromServer(q).catch(() => getDocs(q)) : await getDocs(q);
+    snap.forEach((d) => {
+      const data = d.data() as CustomerLedgerDoc;
+      const code = String(data.customerCode || d.id || '').trim();
+      if (code) {
+        result[code] = data;
+      }
+    });
+  } catch (err) {
+    console.warn('Could not load customer ledgers for admin:', err);
+  }
+  return result;
+}
+
+export function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerReceipt {
   const isRefund =
     entry.billStatus === 'refund' || String(entry.receiptType).toUpperCase() === 'REFUND';
   const creditAmt = round3(Math.max(0, Number(entry.creditAmount || 0)));
@@ -196,6 +231,14 @@ function archivedEntryToReceipt(entry: ArchivedBillEntry): SalesPlayCustomerRece
     payments,
     items: [],
   };
+}
+
+export function ledgerDocToReceipts(ledgerDoc: CustomerLedgerDoc | null | undefined): SalesPlayCustomerReceipt[] {
+  if (!ledgerDoc?.archivedBills?.length) return [];
+  return ledgerDoc.archivedBills
+    .filter((entry) => Boolean(entry?.receiptNumber))
+    .map((entry) => archivedEntryToReceipt(entry))
+    .sort((a, b) => (a.dateTime < b.dateTime ? 1 : -1));
 }
 
 /**

@@ -450,42 +450,43 @@ async function ensureReceiptsSynced(
       }
     }
 
-    // If caller passes older open DUE bills (>48h old), refresh their narrow day windows
-    // so POS settlements or deletions of older credit bills are detected immediately.
+    // If caller passes open DUE bills (or >48h old credit receipts), fetch them directly by
+    // receipt_numbers in 1 fast request so any settlement or deletion inside SalesPlay POS updates immediately.
     if (openBillsToCheck.length > 0) {
-      const checkedDays = new Set<string>();
-      const recentCutoffMs = dRecent.getTime();
-      const narrowFetches: Array<{ dayKey: string; promise: Promise<any[] | null> }> = [];
+      const uniqueOpen = Array.from(
+        new Set(openBillsToCheck.map((b) => String(b || '').trim()).filter(Boolean))
+      );
+      const minWindow =
+        receiptIndex.windowStartDateSql ||
+        formatDateSql(new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000));
+      const maxWindowSql = formatDateSql(maxWindow);
 
-      for (const billNo of openBillsToCheck.slice(0, 12)) {
-        const existing = receiptIndex.byNumber.get(billNo);
-        if (!existing) continue;
-        const dtMs = parseReceiptDateMs(existing.dateTime);
-        if (!dtMs || dtMs >= recentCutoffMs) continue;
-        const dayKey = existing.dateTime.slice(0, 10);
-        if (checkedDays.has(dayKey)) continue;
-        checkedDays.add(dayKey);
-
-        const dayStart = new Date(dtMs - 12 * 60 * 60 * 1000);
-        const dayEnd = new Date(dtMs + 12 * 60 * 60 * 1000);
-        narrowFetches.push({
-          dayKey,
+      const batchPromises: Array<{ chunk: string[]; promise: Promise<any[] | null> }> = [];
+      for (let i = 0; i < uniqueOpen.length; i += 40) {
+        const chunk = uniqueOpen.slice(i, i + 40);
+        batchPromises.push({
+          chunk,
           promise: fetchAllPaginated<any>('/receipts', 'receipts', {
-            created_at_min: formatDateSql(dayStart),
-            created_at_max: formatDateSql(dayEnd),
+            created_at_min: minWindow,
+            created_at_max: maxWindowSql,
+            receipt_numbers: chunk.join(','),
           }).catch(() => null),
         });
       }
 
-      if (narrowFetches.length > 0) {
-        const narrowResults = await Promise.all(
-          narrowFetches.map(async (nf) => ({ dayKey: nf.dayKey, list: await nf.promise }))
+      const batchResults = await Promise.all(
+        batchPromises.map(async (bp) => ({ chunk: bp.chunk, list: await bp.promise }))
+      );
+      for (const { chunk, list } of batchResults) {
+        if (!Array.isArray(list)) continue;
+        ingestRawReceipts(list);
+        const returnedNos = new Set(
+          list.map((r: any) => String(r?.receipt_number || '').trim()).filter(Boolean)
         );
-        for (const { dayKey, list } of narrowResults) {
-          if (!Array.isArray(list)) continue;
-          const seenInDay = ingestRawReceipts(list);
-          for (const [recNo, existing] of receiptIndex.byNumber.entries()) {
-            if (existing.dateTime && existing.dateTime.startsWith(dayKey) && !seenInDay.has(recNo)) {
+        for (const recNo of chunk) {
+          if (!returnedNos.has(recNo)) {
+            const existing = receiptIndex.byNumber.get(recNo);
+            if (existing && (!existing.dateTime || existing.dateTime >= minWindow)) {
               receiptIndex.byNumber.delete(recNo);
             }
           }
@@ -894,9 +895,12 @@ export async function handleSalesPlayRequest(
     // 2.2b1 Bulk export of all customers + their POS receipts for Admin Firestore sync
     if (pathname === '/api/salesplay/export-customer-snapshots' && req.method === 'GET') {
       const forceRefresh = parsedUrl.searchParams.get('force') === '1';
+      const openCreditBills = Array.from(receiptIndex.byNumber.values())
+        .filter((r) => r.creditAmount > 0 && String(r.receiptType).toUpperCase() !== 'REFUND')
+        .map((r) => r.receiptNumber);
       const [customers] = await Promise.all([
         getCustomersCached(forceRefresh),
-        ensureReceiptsSynced(forceRefresh, [], forceRefresh),
+        ensureReceiptsSynced(forceRefresh, openCreditBills, forceRefresh),
       ]);
 
       const snapshots = customers.map((c: any) => {
@@ -947,9 +951,12 @@ export async function handleSalesPlayRequest(
     // 2.2b2 Admin Store & Credit Analytics (powered by incremental receiptIndex, zero extra Firestore reads)
     if (pathname === '/api/salesplay/admin-insights' && req.method === 'GET') {
       const forceRefresh = parsedUrl.searchParams.get('force') === '1';
+      const openCreditBills = Array.from(receiptIndex.byNumber.values())
+        .filter((r) => r.creditAmount > 0 && String(r.receiptType).toUpperCase() !== 'REFUND')
+        .map((r) => r.receiptNumber);
       const [customers] = await Promise.all([
         getCustomersCached(forceRefresh),
-        ensureReceiptsSynced(forceRefresh),
+        ensureReceiptsSynced(forceRefresh, openCreditBills, false),
       ]);
 
       const customerIdToCode = new Map<string, string>();
